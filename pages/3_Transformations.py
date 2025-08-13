@@ -28,7 +28,6 @@ def _infer_datetime(s: pd.Series) -> Optional[pd.Series]:
         dt = pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
         if dt.notna().sum() >= max(5, int(0.5 * len(s))):
             return dt
-        # second try: dayfirst
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
         if dt.notna().sum() >= max(5, int(0.5 * len(s))):
             return dt
@@ -42,7 +41,6 @@ def _suggest_k_for_series(s: pd.Series, tfm: str) -> float:
 def _new_name_for_transformed(stem: str) -> str:
     return f"{stem}__tfm.csv"
 
-# keep per-dataset config in session to avoid refresh loss
 def _cfg_key(dataset: str) -> str:
     return f"tfm_cfg::{dataset}"
 
@@ -118,10 +116,8 @@ st.write(f"**Transformable metrics (numeric):** {len(metric_cols)}")
 # ---------------------------------
 cfg_key = _cfg_key(dataset)
 if cfg_key not in st.session_state:
-    # initialize fresh config with suggestions
     rows = []
     for m in metric_cols:
-        # default transform suggestion: based on skew; simple rule: right-skew → Log, else NegExp light
         s = pd.to_numeric(df_raw[m], errors="coerce").dropna()
         skew = float(s.skew()) if len(s) > 2 else 0.0
         tfm_default = "Log" if skew > 1.0 else "NegExp"
@@ -135,10 +131,13 @@ if cfg_key not in st.session_state:
             "lag_months": 0,
             "adstock_alpha": 0.0,
             "order": _default_order(),
+            # new scaling fields
+            "scaling": "None",
+            "scale_min": 0.0,
+            "scale_max": 1.0,
         })
     st.session_state[cfg_key] = pd.DataFrame(rows)
 else:
-    # ensure we include any new columns that appeared since last time
     cfg_df = st.session_state[cfg_key].copy()
     known = set(cfg_df["metric"])
     new_rows = []
@@ -156,20 +155,26 @@ else:
                 "lag_months": 0,
                 "adstock_alpha": 0.0,
                 "order": _default_order(),
+                "scaling": "None",
+                "scale_min": 0.0,
+                "scale_max": 1.0,
             })
     if new_rows:
         st.session_state[cfg_key] = pd.concat([cfg_df, pd.DataFrame(new_rows)], ignore_index=True)
 
-# filter cfg to metrics still present
+# keep only metrics present
 cfg_df = st.session_state[cfg_key]
 cfg_df = cfg_df[cfg_df["metric"].isin(metric_cols)].reset_index(drop=True)
-st.session_state[cfg_key] = cfg_df  # keep synced
+st.session_state[cfg_key] = cfg_df
 
 # ---------------------------------
 # Editor
 # ---------------------------------
-st.markdown("#### Configure transformations")
-st.caption("Curvature **k** applies to all transforms (Log: log(1+k·x), NegExp: 1−exp(−k·x)). Use **Apply suggested k** to auto-fill from data (based on mean).")
+st.markdown("#### Configure transformations & scaling")
+st.caption(
+    "Curvature **k** applies to Log/NegExp (Log: log(1+k·x), NegExp: 1−exp(−k·x)). "
+    "Scaling is applied at the end. For **MinMax**, set `scale_min` & `scale_max`."
+)
 
 edited_cfg = st.data_editor(
     cfg_df,
@@ -187,7 +192,23 @@ edited_cfg = st.data_editor(
         "adstock_alpha": st.column_config.NumberColumn("Adstock α (0–1)", min_value=0.0, max_value=1.0, step=0.05,
                                                        help="Decay; effective_t = x_t + αx_{t-1} + ... + α^K x_{t-K}"),
         "order": st.column_config.SelectboxColumn("Order", options=["Transform→Adstock+Lag","Adstock+Lag→Transform"],
-                                                  help="Choose whether to transform before or after adstock/lag.")
+                                                  help="Choose whether to transform before or after adstock/lag."),
+        # NEW: scaling
+        "scaling": st.column_config.SelectboxColumn(
+            "Scaling",
+            options=[
+                "None",
+                "MinMax",
+                "Standardize (z-score)",
+                "Robust (median/IQR)",
+                "Mean norm (÷ mean)",
+                "Max norm (÷ max)",
+                "Unit length (L2)",
+            ],
+            help="Applied after transform/adstock+lag."
+        ),
+        "scale_min": st.column_config.NumberColumn("scale_min (for MinMax)", help="Lower bound for MinMax scaling."),
+        "scale_max": st.column_config.NumberColumn("scale_max (for MinMax)", help="Upper bound for MinMax scaling."),
     }
 )
 
@@ -198,7 +219,6 @@ with c1:
         for i, row in tmp.iterrows():
             tfm = str(row.get("transform", "None"))
             if tfm in ("Log","NegExp"):
-                # recompute suggestion from current filtered df
                 s = pd.to_numeric(df_raw[row["metric"]], errors="coerce")
                 ksug = _suggest_k_for_series(s, tfm)
                 tmp.at[i, "k"] = round(ksug, 6)
@@ -210,7 +230,7 @@ with c2:
         del st.session_state[cfg_key]
         st.experimental_rerun()
 with c3:
-    st.caption("Tip: ‘k’ larger → faster saturation (stronger diminishing returns).")
+    st.caption("Tip: For **MinMax**, default [0,1] is common; for modeling, Standardize/Robust can help.")
 
 # Persist edits
 st.session_state[cfg_key] = edited_cfg
@@ -230,13 +250,18 @@ else:
     lag = int(row["lag_months"])
     alpha = float(row["adstock_alpha"])
     order = str(row["order"])
+    scaling = str(row.get("scaling", "None"))
+    scale_min = float(row.get("scale_min", 0.0))
+    scale_max = float(row.get("scale_max", 1.0))
 
     raw = pd.to_numeric(df_raw[preview_metric], errors="coerce").fillna(0.0)
-    eff = transforms.apply_with_order(raw, tfm, k, lag, alpha, order)
+    eff = transforms.apply_with_order(
+        raw, tfm, k, lag, alpha, order,
+        scaling=scaling, scale_min=scale_min, scale_max=scale_max
+    )
 
-    # show quick stats
     stats = pd.DataFrame({
-        "Series": ["Original", "Transformed"],
+        "Series": ["Original", "Transformed+Scaled"],
         "Mean": [raw.mean(), eff.mean()],
         "Std": [raw.std(), eff.std()],
         "Min": [raw.min(), eff.min()],
@@ -245,11 +270,10 @@ else:
     })
     st.dataframe(stats, use_container_width=True)
 
-    # charts
     if "_tfm_dt" in df_raw.columns:
-        plot_df = pd.DataFrame({"t": df_raw["_tfm_dt"], "Original": raw, "Transformed": eff}).set_index("t")
+        plot_df = pd.DataFrame({"t": df_raw["_tfm_dt"], "Original": raw, "Transformed+Scaled": eff}).set_index("t")
     else:
-        plot_df = pd.DataFrame({"idx": np.arange(len(raw)), "Original": raw, "Transformed": eff}).set_index("idx")
+        plot_df = pd.DataFrame({"idx": np.arange(len(raw)), "Original": raw, "Transformed+Scaled": eff}).set_index("idx")
     st.line_chart(plot_df)
 
 # ---------------------------------
@@ -258,7 +282,6 @@ else:
 st.divider()
 st.markdown("#### Save transformed dataset")
 
-# Build config rows for saving
 cfg_rows = []
 for _, r in edited_cfg.iterrows():
     if bool(r.get("use", True)):
@@ -269,24 +292,22 @@ for _, r in edited_cfg.iterrows():
             "lag_months": int(r["lag_months"]),
             "adstock_alpha": float(r["adstock_alpha"]),
             "order": str(r["order"]),
+            "scaling": str(r.get("scaling", "None")),
+            "scale_min": float(r.get("scale_min", 0.0)),
+            "scale_max": float(r.get("scale_max", 1.0)),
             "suggested_k": float(r.get("suggested_k", np.nan)),
             "use": True
         })
 
 if st.button("💾 Save transformed CSV & metadata", type="primary"):
     try:
-        # Apply transforms
         df_applied, meta = transforms.apply_bulk(df_raw, cfg_rows)
 
-        # File names
         stem = os.path.splitext(os.path.basename(dataset))[0]
         out_csv = _new_name_for_transformed(stem)
         out_path = os.path.join(DATA_DIR, out_csv)
-
-        # Keep original columns + new __tfm columns
         df_applied.to_csv(out_path, index=False)
 
-        # Save meta for downstream pages (Results/Budget use this)
         meta_out = {
             "source_dataset": dataset,
             "time_col": (time_col if time_col != "— (none)" else None),
@@ -300,7 +321,6 @@ if st.button("💾 Save transformed CSV & metadata", type="primary"):
         with open(meta_path, "w") as f:
             json.dump(meta_out, f, indent=2)
 
-        # Update session defaults used by Modeling page
         st.session_state["mmm_current_dataset"] = out_csv
         st.session_state["mmm_target"] = target_col
 
