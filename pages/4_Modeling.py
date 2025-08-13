@@ -5,6 +5,7 @@ import numpy as np
 import os
 import io
 import json
+import zipfile
 import traceback
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -39,6 +40,41 @@ def _load_transforms_meta(dataset_csv: str) -> Optional[Dict[str, Any]]:
             return None
     return None
 
+def _excel_bytes(sheets: Dict[str, pd.DataFrame]) -> Optional[bytes]:
+    """
+    Try to build an .xlsx in-memory using xlsxwriter, else openpyxl.
+    Returns bytes or None if neither engine is available.
+    """
+    # try xlsxwriter
+    try:
+        import xlsxwriter  # noqa: F401
+        with io.BytesIO() as buf:
+            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                for name, df in sheets.items():
+                    df.to_excel(writer, sheet_name=name[:31], index=False)
+            return buf.getvalue()
+    except Exception:
+        pass
+    # fallback to openpyxl
+    try:
+        import openpyxl  # noqa: F401
+        with io.BytesIO() as buf:
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                for name, df in sheets.items():
+                    df.to_excel(writer, sheet_name=name[:31], index=False)
+            return buf.getvalue()
+    except Exception:
+        return None
+
+def _zip_csv_bytes(sheets: Dict[str, pd.DataFrame]) -> bytes:
+    """Pack multiple CSVs into a single ZIP (bytes)."""
+    with io.BytesIO() as zip_buf:
+        with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, df in sheets.items():
+                csv_bytes = df.to_csv(index=False).encode("utf-8")
+                zf.writestr(f"{name}.csv", csv_bytes)
+        return zip_buf.getvalue()
+
 # ---------- Data pick ----------
 files = _list_csvs()
 if not files:
@@ -68,8 +104,10 @@ with c1:
 with c2:
     compute_vif = st.checkbox("Compute VIF", value=True, help="Check multicollinearity among features.")
 with c3:
-    force_nonneg = st.checkbox("Force negative estimates to 0", value=True,
-                               help="When ON: use NNLS (if available) or clamp to ≥0; metrics come from constrained predictions.")
+    force_nonneg = st.checkbox(
+        "Force negative estimates to 0", value=True,
+        help="When ON: use NNLS (if available) or clamp to ≥0; ALL metrics come from constrained predictions."
+    )
 with c4:
     have_sklearn = _has_sklearn()
     st.caption(("scikit-learn detected ✓" if have_sklearn else "scikit-learn not available — OLS only"))
@@ -154,7 +192,7 @@ if st.button("🚀 Run all models", disabled=not st.session_state["model_queue"]
     st.session_state["model_results"] = {}
     try:
         for spec in st.session_state["model_queue"]:
-            # Prepare
+            # Prepare data
             X_df, y, _ = modeling.prepare_xy(df, spec["target"], spec["features"], fillna=0.0)
 
             # Fit
@@ -250,11 +288,10 @@ if st.session_state["model_results"]:
 
     st.divider()
 
-    # ---------- Per-model details ----------
+    # ---------- Per-model details (basic charts only) ----------
     st.subheader("🔎 Per-model details")
     for _, blob in st.session_state["model_results"].items():
         spec = blob["spec"]; res = blob["result"]; dc = blob["decomp"]
-
         with st.expander(f"Details — {spec['name']} ({spec['type']})", expanded=False):
             m = res["metrics"]
             st.write({
@@ -266,8 +303,7 @@ if st.session_state["model_results"]:
             coef_df = pd.concat([res["coef"], res["stderr"], res["tvalues"], res["pvalues"]], axis=1)
             coef_df.columns = ["coef", "std_err", "t", "p_value"]
             if force_nonneg:
-                st.info("Non-negative constraint is ON: std_err / t / p_value are not shown (NaN).")
-
+                st.info("Non-negative constraint is ON: std_err / t / p_value are NaN (not applicable under NNLS/clamp).")
             st.markdown("**Coefficients**")
             st.dataframe(coef_df.style.format(precision=6), use_container_width=True)
 
@@ -275,40 +311,41 @@ if st.session_state["model_results"]:
                 st.markdown("**VIF**")
                 st.dataframe(res["vif"].rename("VIF").to_frame(), use_container_width=True)
 
-            preds = pd.DataFrame({"y": blob["y"], "yhat": res["yhat"], "residual": res["residuals"]})
-            st.markdown("**Diagnostics**")
-            st.line_chart(res["residuals"])
-            st.scatter_chart(preds.rename(columns={"y": "Actual", "yhat": "Predicted"})[["Actual", "Predicted"]])
+            # BASIC CHARTS ONLY:
+            # 1) Impactable % as BAR CHART (sorted)
+            ip_df = dc["impactable_pct"].sort_values(ascending=False).rename("Impactable %").to_frame()
+            st.markdown("**Impactable % (bar chart)**")
+            st.bar_chart(ip_df)
 
-            # Decomposition blocks
-            st.markdown("**Decomposition**")
-            st.write({
-                "Base % (intercept)": round(dc["base_pct"], 4),
-                "Incremental % (channels)": round(dc["incremental_pct"], 4),
-                "Carryover % (of total, est.)": round(dc["carryover_pct"], 4),
-            })
-            st.markdown("**Impactable % by channel (sums to 100%)**")
-            st.dataframe(dc["impactable_pct"].to_frame(), use_container_width=True)
+            # 2) Simple Actual vs Predicted scatter (optional single diagnostic)
+            preds = pd.DataFrame({"Actual": blob["y"], "Predicted": res["yhat"]})
+            st.markdown("**Actual vs Predicted (scatter)**")
+            st.scatter_chart(preds)
 
-            # Export to Excel (per-model)
-            with io.BytesIO() as buffer:
-                with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-                    coef_df.to_excel(writer, sheet_name="Coefficients")
-                    pd.DataFrame([m]).to_excel(writer, sheet_name="Metrics", index=False)
-                    preds.to_excel(writer, sheet_name="Predictions", index=False)
-                    if res.get("vif") is not None:
-                        res["vif"].rename("VIF").to_frame().to_excel(writer, sheet_name="VIF")
-                    # decomposition
-                    pd.DataFrame([{
-                        "Base %": dc["base_pct"],
-                        "Incremental %": dc["incremental_pct"],
-                        "Carryover % (of total)": dc["carryover_pct"],
-                        "Denominator (base+inc)": dc["denominator_total"],
-                    }]).to_excel(writer, sheet_name="Decomposition", index=False)
-                    dc["impactable_pct"].rename("Impactable %").to_frame().to_excel(writer, sheet_name="ImpactablePct")
+            # Export: Excel if available, else ZIP( CSVs )
+            sheets = {
+                "Coefficients": coef_df.reset_index().rename(columns={"index": "term"}),
+                "Metrics": pd.DataFrame([m]),
+                "Predictions": preds.reset_index(drop=True),
+                "ImpactablePct": ip_df.reset_index().rename(columns={"index": "channel"}),
+            }
+            if res.get("vif") is not None:
+                sheets["VIF"] = res["vif"].rename("VIF").to_frame().reset_index().rename(columns={"index": "feature"})
+
+            excel_bytes = _excel_bytes(sheets)
+            if excel_bytes:
                 st.download_button(
                     label=f"⬇️ Download {spec['name']} Excel",
-                    data=buffer.getvalue(),
+                    data=excel_bytes,
                     file_name=f"{spec['name'].replace(' ','_')}_results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            else:
+                zip_bytes = _zip_csv_bytes(sheets)
+                st.warning("Excel engines not available. Providing ZIP of CSVs instead.")
+                st.download_button(
+                    label=f"⬇️ Download {spec['name']} ZIP (CSVs)",
+                    data=zip_bytes,
+                    file_name=f"{spec['name'].replace(' ','_')}_results.zip",
+                    mime="application/zip"
                 )
