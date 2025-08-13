@@ -20,8 +20,7 @@ ORDER_CHOICES = ["Transform → Finite Adstock(K, α)", "Finite Adstock(K, α) �
 NUMERIC_REQUIRED = {"Log", "NegExp", "NegExp+Cannibalization"}
 
 def _list_csvs() -> List[str]:
-    if not os.path.isdir(DATA_DIR):
-        return []
+    if not os.path.isdir(DATA_DIR): return []
     return sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")])
 
 def _ensure_datetime(s: pd.Series, colname: str) -> pd.Series:
@@ -45,44 +44,38 @@ def _suggest_transform(s: pd.Series) -> str:
     zeros = (s_num == 0).sum()
     frac_zero = zeros / max(len(s_num), 1)
     skew = float(pd.Series(s_num).dropna().skew()) if s_num.notna().any() else 0.0
-    if not nonneg:
-        return "None"
-    if frac_zero >= 0.20:
-        return "NegExp"
-    if skew > 1.0:
-        return "Log"
+    if not nonneg: return "None"
+    if frac_zero >= 0.20: return "NegExp"
+    if skew > 1.0: return "Log"
     return "None"
 
 def _suggest_beta(s: pd.Series) -> float:
     s_num = pd.to_numeric(s, errors="coerce")
     s_pos = s_num[s_num > 0]
-    if s_pos.empty or np.median(s_pos) == 0:
-        return 0.01
+    if s_pos.empty or np.median(s_pos) == 0: return 0.01
     beta = np.log(2.0) / float(np.median(s_pos))
     return float(np.clip(beta, 0.0005, 1.0))
 
 def _initial_table(metrics: List[str], df: pd.DataFrame) -> pd.DataFrame:
-    sug = [ _suggest_transform(df[m]) for m in metrics ]
+    sug = [_suggest_transform(df[m]) for m in metrics]
     return pd.DataFrame({
         "metric": metrics,
         "suggested": sug,
         "transform": sug,
-        "lag_months": [0] * len(metrics),       # K
-        "adstock_alpha": [0.0] * len(metrics),  # α
-        "order": ["Transform → Finite Adstock(K, α)"] * len(metrics),
+        "lag_months": [0]*len(metrics),        # K
+        "adstock_alpha": [0.0]*len(metrics),   # α
+        "order": ["Transform → Finite Adstock(K, α)"]*len(metrics),
     })
 
 def _merge_config(persisted: pd.DataFrame, metrics: List[str], df: pd.DataFrame) -> pd.DataFrame:
-    persisted = persisted.copy()
-    keep = persisted[persisted["metric"].isin(metrics)]
+    keep = persisted[persisted["metric"].isin(metrics)].copy()
     missing = [m for m in metrics if m not in keep["metric"].tolist()]
     if missing:
         keep = pd.concat([keep, _initial_table(missing, df)], ignore_index=True)
     keep["lag_months"] = keep["lag_months"].fillna(0).astype(int)
     keep["adstock_alpha"] = keep["adstock_alpha"].fillna(0.0).astype(float)
     keep["transform"] = keep["transform"].fillna("None").astype(str)
-    if "order" not in keep.columns:
-        keep["order"] = "Transform → Finite Adstock(K, α)"
+    if "order" not in keep.columns: keep["order"] = "Transform → Finite Adstock(K, α)"
     keep["order"] = keep["order"].astype(str)
     return keep
 
@@ -105,16 +98,14 @@ def _apply_pipeline(df: pd.DataFrame,
     out = df.copy()
     group_cols = [c for c in [id_col, seg_col] if c]
 
-    # Need ordering if K>0 or α>0
     needs_order = (cfg["lag_months"].astype(int) > 0).any() or (cfg["adstock_alpha"].astype(float) > 0).any()
     if needs_order:
         if not time_col or time_col not in out.columns:
             raise ValueError("Finite Adstock requires a valid Time column. Please select one.")
         out[time_col] = _ensure_datetime(out[time_col], time_col)
-        sort_keys = group_cols + [time_col]
-        out = out.sort_values(sort_keys)
+        out = out.sort_values(group_cols + [time_col] if group_cols else [time_col])
 
-    # Cannibal pool (for NegExp+Cannibalization)
+    # Cannibal pool
     cannibal_metrics = cfg.loc[cfg["transform"].isin(["NegExp", "NegExp+Cannibalization"]), "metric"].tolist()
     numeric_pool = out.copy()
     for c in cannibal_metrics:
@@ -133,72 +124,43 @@ def _apply_pipeline(df: pd.DataFrame,
             raise ValueError(f"Metric `{m}` not found in dataset.")
         s_raw = out[m].copy()
 
-        # Helpers to apply finite adstock over groups
-        def apply_finite(x: pd.Series) -> pd.Series:
-            return transforms.adstock_finite(x, alpha=a, K=K)
+        def finite_adstock(series: pd.Series) -> pd.Series:
+            return transforms.adstock_finite(series, alpha=a, K=K)
 
-        def do_base(x: pd.Series) -> pd.Series:
-            if base in NUMERIC_REQUIRED:
-                x = pd.to_numeric(x, errors="coerce").fillna(0)
-            if base == "Log":
-                return transforms.log_transform(x)
-            elif base == "NegExp":
+        def do_base(series: pd.Series) -> pd.Series:
+            x = pd.to_numeric(series, errors="coerce").fillna(0) if base in NUMERIC_REQUIRED else series
+            if base == "Log": return transforms.log_transform(x)
+            if base == "NegExp":
                 beta = float(beta_map.get(m, _suggest_beta(out[m])))
                 return transforms.negexp(x, beta=beta)
-            elif base == "NegExp+Cannibalization":
+            if base == "NegExp+Cannibalization":
                 beta = float(beta_map.get(m, _suggest_beta(out[m])))
                 return transforms.negexp_cannibal(x, beta=beta, pool=pool_norm, gamma=float(gamma))
-            else:
-                return x
+            return x
 
         if order == "Finite Adstock(K, α) → Transform":
-            # First finite adstock on RAW
-            if (K > 0) or (a > 0):
-                if group_cols:
-                    s_eff = out.groupby(group_cols, group_keys=False).apply(
-                        lambda g: apply_finite(s_raw.loc[g.index])
-                    ).reset_index(level=list(range(len(group_cols))), drop=True)
-                else:
-                    s_eff = apply_finite(s_raw)
-            else:
-                s_eff = s_raw
+            s_eff = finite_adstock(s_raw) if (K>0 or a>0) else s_raw
             s_t = do_base(s_eff)
         else:
-            # Transform first, then finite adstock
             s_base = do_base(s_raw)
-            if (K > 0) or (a > 0):
-                if group_cols:
-                    s_t = out.groupby(group_cols, group_keys=False).apply(
-                        lambda g: apply_finite(s_base.loc[g.index])
-                    ).reset_index(level=list(range(len(group_cols))), drop=True)
-                else:
-                    s_t = apply_finite(s_base)
-            else:
-                s_t = s_base
+            s_t = finite_adstock(s_base) if (K>0 or a>0) else s_base
 
         out[f"{m}__tfm"] = s_t
 
-    if needs_order:
-        out = out.sort_index()
-
+    if needs_order: out = out.sort_index()
     return out
 
 def _curve_preview_df(x: np.ndarray, transform: str, beta: float, gamma: float) -> pd.DataFrame:
     x = np.maximum(x, 0.0)
     if transform == "Log":
-        y = np.log1p(x)
-        df = pd.DataFrame({"x": x, "Log(x)": y})
-    elif transform == "NegExp":
-        y = 1.0 - np.exp(-beta * x)
-        df = pd.DataFrame({"x": x, "NegExp": y})
-    elif transform == "NegExp+Cannibalization":
+        y = np.log1p(x); return pd.DataFrame({"x": x, "Log(x)": y}).set_index("x")
+    if transform == "NegExp":
+        y = 1.0 - np.exp(-beta * x); return pd.DataFrame({"x": x, "NegExp": y}).set_index("x")
+    if transform == "NegExp+Cannibalization":
         y_base = 1.0 - np.exp(-beta * x)
         y_cann = y_base * np.exp(-gamma * 1.0)  # pool=1 for intuition
-        df = pd.DataFrame({"x": x, "NegExp (base)": y_base, "With Cannibalization": y_cann})
-    else:
-        df = pd.DataFrame({"x": x, "None": x})
-    return df.set_index("x")
-
+        return pd.DataFrame({"x": x, "NegExp (base)": y_base, "With Cannibalization": y_cann}).set_index("x")
+    return pd.DataFrame({"x": x, "None": x}).set_index("x")
 # =========================
 # Dataset & keys
 # =========================
@@ -226,9 +188,9 @@ if time_col:
         min_dt, max_dt = dt.min(), dt.max()
         c1, c2 = st.columns(2)
         with c1:
-            start_date = st.date_input("Start date", value=min_dt.date() if pd.notna(min_dt) else None)
+            start_date = st.date_input("Start date", value=min_dt.date() if pd.notna(min_dt) else None, key=f"tfm_start_{dataset}")
         with c2:
-            end_date = st.date_input("End date", value=max_dt.date() if pd.notna(max_dt) else None)
+            end_date = st.date_input("End date", value=max_dt.date() if pd.notna(max_dt) else None, key=f"tfm_end_{dataset}")
         if start_date and end_date:
             mask = (dt >= pd.to_datetime(start_date)) & (dt <= pd.to_datetime(end_date))
             df = df.loc[mask].copy()
@@ -238,106 +200,100 @@ if time_col:
         st.warning(f"Time filter not applied: {e}")
 
 # =========================
-# Metrics table (stateful)
+# Metrics and persistent state
 # =========================
 exclude = {c for c in [target_col, time_col, id_col, seg_col] if c}
 metric_candidates = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
-
 if not metric_candidates:
     st.error("No numeric metrics available for transformation after exclusions. Check your selections.")
     st.stop()
 
-# Persistent per-dataset state
-if "tfm_state" not in st.session_state:
-    st.session_state["tfm_state"] = {}
-
+# session state scaffold
+if "tfm_state" not in st.session_state: st.session_state["tfm_state"] = {}
 state = st.session_state["tfm_state"].get(dataset)
 if state is None:
+    init_cfg = _initial_table(metric_candidates, df)
+    init_beta = {m: _suggest_beta(df[m]) for m in metric_candidates}
     state = {
-        "cfg": _initial_table(metric_candidates, df),
-        "beta_map": {m: _suggest_beta(df[m]) for m in metric_candidates},
-        "needs_gamma": False,
+        "pending_cfg": init_cfg.copy(),
+        "saved_cfg": init_cfg.copy(),
+        "pending_beta": init_beta.copy(),
+        "saved_beta": init_beta.copy(),
+        "pending_gamma": 0.3,
+        "saved_gamma": 0.3,
     }
     st.session_state["tfm_state"][dataset] = state
 else:
-    state["cfg"] = _merge_config(state["cfg"], metric_candidates, df)
+    # keep existing edits, but merge with evolving columns
+    state["pending_cfg"] = _merge_config(state["pending_cfg"], metric_candidates, df)
+    state["saved_cfg"]   = _merge_config(state["saved_cfg"],   metric_candidates, df)
+    # add beta defaults for any new metrics
+    for m in metric_candidates:
+        if m not in state["pending_beta"]:
+            state["pending_beta"][m] = _suggest_beta(df[m])
+        if m not in state["saved_beta"]:
+            state["saved_beta"][m] = state["pending_beta"][m]
 
-cfg_df = state["cfg"]
+# =========================
+# EDIT FORM (no reruns until submit)
+# =========================
+with st.form(key=f"tfm_form_{dataset}", clear_on_submit=False):
+    st.subheader("Configure per-metric transforms (edits won’t rerun until you click **Save config**)")
 
-st.subheader("Configure per-metric transforms")
-st.caption("Set transform, **Lag K** and **Adstock α**. Finite adstock computes:  x_t + α x_{t-1} + α² x_{t-2} + … + α^K x_{t-K}.")
-
-cfg_df = st.data_editor(
-    cfg_df,
-    use_container_width=True,
-    num_rows="fixed",
-    hide_index=True,
-    column_config={
-        "metric": st.column_config.Column("Metric", disabled=True, help="Input column to transform"),
-        "suggested": st.column_config.Column("Suggested", disabled=True, help="Heuristic based on zeros, skewness, and sign"),
-        "transform": st.column_config.SelectboxColumn(
-            "Transform",
-            options=TRANS_CHOICES,
-            required=True,
-            help="None / Log / Negative Exponential / NegExp+Cannibalization"
-        ),
-        "lag_months": st.column_config.NumberColumn(
-            "Lag K (months)", min_value=0, max_value=24, step=1,
-            help="K in the finite adstock sum."
-        ),
-        "adstock_alpha": st.column_config.NumberColumn(
-            "Adstock α", min_value=0.0, max_value=0.99, step=0.01,
-            help="Weight decay per lag: α^i on x_{t-i}"
-        ),
-        "order": st.column_config.SelectboxColumn(
-            "Order",
-            options=ORDER_CHOICES,
-            help="Apply base transform before finite adstock, or after."
-        ),
-    },
-    key=f"tfm_table_editor_{dataset}",
-)
-
-# Persist
-cfg_df["lag_months"] = cfg_df["lag_months"].fillna(0).astype(int)
-cfg_df["adstock_alpha"] = cfg_df["adstock_alpha"].fillna(0.0).astype(float)
-cfg_df["transform"] = cfg_df["transform"].fillna("None").astype(str)
-cfg_df["order"] = cfg_df["order"].fillna(ORDER_CHOICES[0]).astype(str)
-state["cfg"] = cfg_df
-st.session_state["tfm_state"][dataset] = state
-
-# ---------- Conditional parameter UI ----------
-needs_beta_metrics = cfg_df.loc[cfg_df["transform"].isin(["NegExp", "NegExp+Cannibalization"]), "metric"].tolist()
-if needs_beta_metrics:
-    st.markdown("**β (per-metric) for Negative Exponential**")
-    cols = st.columns(min(3, len(needs_beta_metrics)))
-    for i, m in enumerate(needs_beta_metrics):
-        with cols[i % len(cols)]:
-            default_beta = state["beta_map"].get(m, _suggest_beta(df[m]))
-            state["beta_map"][m] = st.slider(
-                f"{m} • β", 0.0005, 1.0, float(default_beta), 0.0005, key=f"beta_{dataset}_{m}"
-            )
-            x50 = np.log(2.0) / max(state["beta_map"][m], 1e-9)
-            st.caption(f"x₅₀ ≈ {x50:,.2f}")
-
-needs_gamma = cfg_df["transform"].eq("NegExp+Cannibalization").any()
-state["needs_gamma"] = bool(needs_gamma)
-gamma = 0.3
-if needs_gamma:
-    gamma = st.slider(
-        "Cannibalization strength γ (global)",
-        0.0, 2.0, 0.3, 0.05,
-        help="(1 − e^{−βx}) · e^{−γ·pool}, with pool the normalized sum of other NegExp metrics."
+    edited_cfg = st.data_editor(
+        state["pending_cfg"],
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        column_config={
+            "metric": st.column_config.Column("Metric", disabled=True, help="Input column to transform"),
+            "suggested": st.column_config.Column("Suggested", disabled=True, help="Heuristic based on zeros, skewness, sign"),
+            "transform": st.column_config.SelectboxColumn("Transform", options=TRANS_CHOICES, required=True),
+            "lag_months": st.column_config.NumberColumn("Lag K (months)", min_value=0, max_value=24, step=1),
+            "adstock_alpha": st.column_config.NumberColumn("Adstock α", min_value=0.0, max_value=0.99, step=0.01),
+            "order": st.column_config.SelectboxColumn("Order", options=ORDER_CHOICES),
+        },
+        key=f"tfm_editor_{dataset}",
     )
 
-# Coercion report
-need_numeric_cols = cfg_df.loc[cfg_df["transform"].isin(list(NUMERIC_REQUIRED)), "metric"].tolist()
-if need_numeric_cols:
-    report = _coerce_numeric_report(df, need_numeric_cols)
-    with st.expander("Coercion report (values that would become NaN if coerced to numeric):", expanded=False):
-        st.json(report)
+    # Which rows need beta?
+    needs_beta_metrics = edited_cfg.loc[edited_cfg["transform"].isin(["NegExp", "NegExp+Cannibalization"]), "metric"].tolist()
+    if needs_beta_metrics:
+        st.markdown("**β (per-metric) for Negative Exponential**")
+        cols = st.columns(min(3, len(needs_beta_metrics)))
+        for i, m in enumerate(needs_beta_metrics):
+            with cols[i % len(cols)]:
+                default_beta = state["pending_beta"].get(m, _suggest_beta(df[m]))
+                state["pending_beta"][m] = st.slider(
+                    f"{m} • β", 0.0005, 1.0, float(default_beta), 0.0005, key=f"beta_pending_{dataset}_{m}"
+                )
+                x50 = np.log(2.0) / max(state["pending_beta"][m], 1e-9)
+                st.caption(f"x₅₀ ≈ {x50:,.2f}")
 
-# ---------- Guide ----------
+    needs_gamma = edited_cfg["transform"].eq("NegExp+Cannibalization").any()
+    if needs_gamma:
+        state["pending_gamma"] = st.slider(
+            "Cannibalization strength γ (global)",
+            0.0, 2.0, float(state["pending_gamma"]), 0.05,
+            key=f"gamma_pending_{dataset}",
+            help="(1 − e^{−βx}) · e^{−γ·pool}, pool = normalized sum of other NegExp metrics."
+        )
+
+    saved = st.form_submit_button("💾 Save config")
+    if saved:
+        # sanitize, persist to "saved"
+        edited_cfg["lag_months"] = edited_cfg["lag_months"].fillna(0).astype(int)
+        edited_cfg["adstock_alpha"] = edited_cfg["adstock_alpha"].fillna(0.0).astype(float)
+        edited_cfg["transform"] = edited_cfg["transform"].fillna("None").astype(str)
+        edited_cfg["order"] = edited_cfg["order"].fillna(ORDER_CHOICES[0]).astype(str)
+
+        state["pending_cfg"] = edited_cfg.copy()
+        state["saved_cfg"]   = edited_cfg.copy()
+        state["saved_beta"]  = state["pending_beta"].copy()
+        state["saved_gamma"] = float(state["pending_gamma"])
+        st.success("Config saved ✓")
+
+# Helpful guide (outside the form)
 with st.expander("📘 Transform Guide (math & intuition)", expanded=False):
     st.markdown(r"""
 **Finite Adstocked Lag (this app):**  
@@ -347,57 +303,65 @@ with st.expander("📘 Transform Guide (math & intuition)", expanded=False):
 - **K** = Lag months, **α** = Adstock. Example: K=2, α=0.5 → \(x_t + 0.5x_{t-1} + 0.25x_{t-2}\).
 
 **Log:** \( y = \ln(1 + x) \)  
-**NegExp:** \( y = 1 - e^{-\beta x} \)  (choose β via \(x_{50}=\ln 2/\beta\))  
+**NegExp:** \( y = 1 - e^{-\beta x} \) (choose β via \(x_{50}=\ln 2/\beta\))  
 **NegExp+Cannibalization:** \( y = (1 - e^{-\beta x}) \cdot e^{-\gamma \cdot \text{pool}} \)
 """)
 
-# ---------- Curve previews (sparklines) ----------
-with st.expander("📈 Curve previews (by metric)", expanded=False):
-    selectable = [m for m in cfg_df["metric"].tolist() if cfg_df.loc[cfg_df["metric"]==m, "transform"].iloc[0] != "None"]
+# Coercion report for the SAVED cfg
+need_numeric_cols = state["saved_cfg"].loc[state["saved_cfg"]["transform"].isin(list(NUMERIC_REQUIRED)), "metric"].tolist()
+if need_numeric_cols:
+    report = _coerce_numeric_report(df, need_numeric_cols)
+    with st.expander("Coercion report (values that would become NaN if coerced to numeric):", expanded=False):
+        st.json(report)
+
+# ---------- Curve previews (use SAVED config) ----------
+with st.expander("📈 Curve previews (by metric from saved config)", expanded=False):
+    selectable = [m for m in state["saved_cfg"]["metric"].tolist()
+                  if state["saved_cfg"].set_index("metric").loc[m, "transform"] != "None"]
     if selectable:
-        pick = st.multiselect("Select metrics to preview", selectable, default=selectable[:6])
+        pick = st.multiselect("Select metrics to preview", selectable, default=selectable[:6], key=f"curve_pick_{dataset}")
         for m in pick:
-            t = cfg_df.loc[cfg_df["metric"]==m, "transform"].iloc[0]
-            beta = state["beta_map"].get(m, _suggest_beta(df[m]))
+            t = state["saved_cfg"].set_index("metric").loc[m, "transform"]
+            beta = state["saved_beta"].get(m, _suggest_beta(df[m]))
             s = pd.to_numeric(df[m], errors="coerce").fillna(0)
             x_max = max(1.0, float(np.nanpercentile(s, 95)))
             x = np.linspace(0.0, x_max*1.2, 120)
-            chart_df = _curve_preview_df(x, t, beta=beta, gamma=(gamma if needs_gamma else 0.0))
+            chart_df = _curve_preview_df(x, t, beta=beta, gamma=state["saved_gamma"])
             st.caption(f"**{m}** — Transform: {t}")
             st.line_chart(chart_df)
     else:
-        st.info("Select a transform other than 'None' to see a curve preview.")
+        st.info("Choose a transform other than 'None' and save the config to preview.")
 
 st.divider()
 
 # =========================
-# Preview + Save
+# Preview + Save (use SAVED config)
 # =========================
-c1, c2 = st.columns(2)
-with c1:
-    preview_n = st.slider("Rows to preview", min_value=50, max_value=1000, value=200, step=50)
-with c2:
+col1, col2 = st.columns(2)
+with col1:
+    preview_n = st.slider("Rows to preview", min_value=50, max_value=1000, value=200, step=50, key=f"preview_n_{dataset}")
+with col2:
     out_name_default = f"{os.path.splitext(dataset)[0]}__tfm.csv"
-    out_name = st.text_input("Output filename (CSV)", value=out_name_default)
+    out_name = st.text_input("Output filename (CSV)", value=out_name_default, key=f"outname_{dataset}")
 
 def _apply_all():
-    # Need time column if K>0 or α>0
-    if ((cfg_df["lag_months"].astype(int) > 0).any() or (cfg_df["adstock_alpha"].astype(float) > 0).any()) and not time_col:
+    cfg = state["saved_cfg"]
+    if ((cfg["lag_months"].astype(int) > 0).any() or (cfg["adstock_alpha"].astype(float) > 0).any()) and not time_col:
         raise ValueError("Finite Adstock selected but no Time column chosen.")
     return _apply_pipeline(
         df=df,
-        cfg=cfg_df,
-        beta_map=state["beta_map"],
+        cfg=cfg,
+        beta_map=state["saved_beta"],
         id_col=id_col,
         seg_col=seg_col,
         time_col=time_col,
-        gamma=(gamma if state["needs_gamma"] else 0.0),
+        gamma=state["saved_gamma"],
     )
 
 left, right = st.columns(2)
 
 with left:
-    if st.button("👀 Preview transformed dataset"):
+    if st.button("👀 Preview transformed dataset", key=f"btn_preview_{dataset}"):
         try:
             df_prev = _apply_all()
             added = [c for c in df_prev.columns if c.endswith("__tfm")]
@@ -407,7 +371,7 @@ with left:
             st.error(f"Preview failed: {e}")
 
 with right:
-    if st.button("💾 Save transformed dataset"):
+    if st.button("💾 Save transformed dataset", key=f"btn_save_{dataset}"):
         try:
             df_out = _apply_all()
             out_csv = out_name if out_name.strip().lower().endswith(".csv") else out_name + ".csv"
@@ -421,9 +385,9 @@ with right:
                 "id_col": id_col,
                 "seg_col": seg_col,
                 "target_col": target_col,
-                "beta_map": state["beta_map"],
-                "config": cfg_df.to_dict(orient="records"),
-                "gamma": (gamma if state["needs_gamma"] else 0.0),
+                "beta_map": state["saved_beta"],
+                "config": state["saved_cfg"].to_dict(orient="records"),
+                "gamma": state["saved_gamma"],
                 "output": out_csv,
             }
             with open(os.path.join(DATA_DIR, f"transforms_{os.path.splitext(dataset)[0]}.json"), "w") as f:
