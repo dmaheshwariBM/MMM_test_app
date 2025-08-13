@@ -4,14 +4,15 @@ import numpy as np
 import pandas as pd
 from typing import Tuple, Dict, Any, List, Optional
 
-# Optional p-values (SciPy). Safe if unavailable.
+# Optional SciPy (for p-values and NNLS). Safe if unavailable.
 try:
     from scipy import stats as _scistats  # type: ignore
-    _HAVE_SCIPY_STATS = True
+    from scipy.optimize import nnls as _nnls  # type: ignore
+    _HAVE_SCIPY = True
 except Exception:
-    _HAVE_SCIPY_STATS = False
+    _HAVE_SCIPY = False
 
-# Optional scikit-learn (for Ridge/Lasso). Code still works without it.
+# Optional scikit-learn (Ridge/Lasso). Code still works without it.
 try:
     import sklearn  # type: ignore
     _HAVE_SKLEARN = True
@@ -56,7 +57,7 @@ def prepare_xy(df: pd.DataFrame, target: str, features: List[str], fillna: float
 
 
 # ----------------------------
-# Core metrics helpers
+# Metrics helpers
 # ----------------------------
 def _add_const(X: np.ndarray) -> np.ndarray:
     return np.hstack([np.ones((X.shape[0], 1)), X])
@@ -88,17 +89,14 @@ def _metrics_from_yhat(y: np.ndarray, yhat: np.ndarray, p: int) -> Dict[str, flo
 def _ols_closed_form(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
     yhat = X @ beta
-    resid = y - yhat
 
-    n = X.shape[0]
-    p = X.shape[1]
+    n, p = X.shape
+    resid = y - yhat
     sse = float(np.sum(resid ** 2))
     ybar = float(np.mean(y)) if n > 0 else 0.0
     sst = float(np.sum((y - ybar) ** 2))
     r2 = np.nan if sst == 0 else 1.0 - sse / sst
-    adj_r2 = np.nan
-    if n > p and not np.isnan(r2):
-        adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / (n - p)
+    adj_r2 = np.nan if (n <= p or np.isnan(r2)) else 1.0 - (1.0 - r2) * (n - 1) / (n - p)
 
     df_resid = max(n - p, 1)
     sigma2 = sse / df_resid
@@ -111,13 +109,17 @@ def _ols_closed_form(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarr
 
     with np.errstate(divide="ignore", invalid="ignore"):
         tvals = beta / se
-    if _HAVE_SCIPY_STATS:
+    if _HAVE_SCIPY:
         pvals = 2.0 * (1.0 - _scistats.t.cdf(np.abs(tvals), df=df_resid))
     else:
         pvals = np.full(beta.shape, np.nan)
 
     metrics = _metrics_from_yhat(y, yhat, p)
-    return beta, yhat, {"metrics": metrics, "stderr": se, "tvalues": tvals, "pvalues": pvals, "residuals": y - yhat}
+    return beta, yhat, {
+        "metrics": metrics,
+        "stderr": se, "tvalues": tvals, "pvalues": pvals,
+        "residuals": y - yhat
+    }
 
 
 def compute_vif(X_df: pd.DataFrame) -> pd.Series:
@@ -140,7 +142,7 @@ def compute_vif(X_df: pd.DataFrame) -> pd.Series:
 
 
 # ----------------------------
-# OLS (with optional non-negative constraint)
+# OLS with optional non-negative constraint
 # ----------------------------
 def ols_model(X_df: pd.DataFrame, y: pd.Series,
               add_constant: bool = True,
@@ -148,10 +150,10 @@ def ols_model(X_df: pd.DataFrame, y: pd.Series,
               force_nonnegative: bool = False) -> Dict[str, Any]:
     """
     If force_nonnegative=True:
-      - Prefer SciPy NNLS if available for b>=0.
-      - Else fit OLS then clamp negatives to 0.
-      - Recompute yhat & ALL metrics from constrained beta.
-      - std_err / t / p_value are set to NaN (not valid under constraint).
+      - Use SciPy NNLS (if available) to fit beta >= 0 (including const when present).
+      - Else fit OLS and clamp betas to >=0.
+      - Recompute predictions/ALL metrics from constrained betas.
+      - std_err/t/p_value are set to NaN (not meaningful under constraint).
     """
     y = pd.to_numeric(y, errors="coerce").fillna(0.0)
     X_df = X_df.copy()
@@ -159,12 +161,12 @@ def ols_model(X_df: pd.DataFrame, y: pd.Series,
         X_df[c] = pd.to_numeric(X_df[c], errors="coerce").fillna(0.0)
 
     X_mat = X_df.values.astype(float)
+    names = list(X_df.columns)
     if add_constant:
         X = _add_const(X_mat)
-        names = ["const"] + list(X_df.columns)
+        names = ["const"] + names
     else:
         X = X_mat
-        names = list(X_df.columns)
 
     if not force_nonnegative:
         beta, yhat, info = _ols_closed_form(X, y.values.astype(float))
@@ -176,26 +178,21 @@ def ols_model(X_df: pd.DataFrame, y: pd.Series,
         yhat_s = pd.Series(yhat, index=y.index, name="yhat")
         metrics = info["metrics"]
     else:
-        # Try SciPy NNLS
-        beta = None
-        try:
-            from scipy.optimize import nnls  # type: ignore
-            beta, _ = nnls(X, y.values.astype(float))
-        except Exception:
-            # Fallback: OLS then clamp
+        # Prefer NNLS if SciPy present; else clamp OLS
+        if _HAVE_SCIPY:
+            beta, _ = _nnls(X, y.values.astype(float))
+        else:
             beta, _, _ = np.linalg.lstsq(X, y.values.astype(float), rcond=None)
-
-        beta = np.maximum(0.0, beta)  # ensure non-negative
+            beta = np.maximum(0.0, beta)
         yhat = X @ beta
-        metrics = _metrics_from_yhat(y.values.astype(float), yhat, X.shape[1])
-
         coef = pd.Series(beta, index=names, name="coef")
-        # Under constraint, classic SE/t/p don't apply
-        stderr = pd.Series([np.nan] * len(names), index=names, name="std_err")
-        tvalues = pd.Series([np.nan] * len(names), index=names, name="t")
-        pvalues = pd.Series([np.nan] * len(names), index=names, name="p_value")
         yhat_s = pd.Series(yhat, index=y.index, name="yhat")
         resid_s = pd.Series(y.values - yhat, index=y.index, name="residual")
+        metrics = _metrics_from_yhat(y.values.astype(float), yhat, X.shape[1])
+        # no valid SE/t/p under constraints
+        stderr = pd.Series([np.nan]*len(names), index=names, name="std_err")
+        tvalues = pd.Series([np.nan]*len(names), index=names, name="t")
+        pvalues = pd.Series([np.nan]*len(names), index=names, name="p_value")
 
     vif = compute_vif(X_df) if compute_vif_flag else None
 
@@ -207,74 +204,60 @@ def ols_model(X_df: pd.DataFrame, y: pd.Series,
 
 
 # ----------------------------
-# Optional Ridge/Lasso (sklearn) with optional non-negativity
+# Optional Ridge / Lasso (sklearn) with optional non-negativity (post-fit clamp)
 # ----------------------------
 def _wrap_sklearn_linear(model, X_df: pd.DataFrame, y: pd.Series,
                          add_constant: bool, compute_vif_flag: bool,
                          force_nonnegative: bool) -> Dict[str, Any]:
     X = X_df.copy()
-    names = list(X.columns)
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce").fillna(0.0)
+
+    # We handle intercept ourselves if add_constant=True
     if add_constant:
-        X = pd.concat([pd.Series(1.0, index=X.index, name="const"), X], axis=1)
-        names = ["const"] + names
+        X_design = pd.concat([pd.Series(1.0, index=X.index, name="const"), X], axis=1).values
+        names = ["const"] + list(X.columns)
+        fit_intercept = False
+    else:
+        X_design = X.values
+        names = list(X.columns)
+        fit_intercept = True
 
-    model.fit(X.values, y.values)
-    yhat = model.predict(X.values)
-    beta = None
+    # Configure model's intercept handling
     try:
-        # Build combined coef vector including intercept if not add_constant
-        if add_constant:
-            # First column is our const; sklearn handled intercept internally if fit_intercept=False
-            if hasattr(model, "coef_"):
-                # We don't know which element corresponds to const in coef_ → treat intercept as 0
-                beta = np.r_[0.0, np.ravel(model.coef_)]
-            else:
-                beta = np.zeros(X.shape[1])
-        else:
-            # add explicit const
-            intercept = float(getattr(model, "intercept_", 0.0))
-            coef_only = np.ravel(getattr(model, "coef_", np.zeros(X.shape[1])))
-            beta = np.r_[intercept, coef_only]
-            # and reflect const in names
-            names = ["const"] + names
-            # rebuild predictions accordingly
-            yhat = (np.c_[np.ones((X.shape[0], 1)), X.values] @ beta)
+        model.set_params(fit_intercept=fit_intercept)  # type: ignore
     except Exception:
-        beta = np.zeros(X.shape[1])
+        pass
 
-    # Optional positivity
+    model.fit(X_design, y.values.astype(float))
+    # Coefficients
+    if hasattr(model, "coef_"):
+        beta = np.ravel(model.coef_)
+    else:
+        beta = np.zeros(X_design.shape[1])
+    if fit_intercept and hasattr(model, "intercept_"):
+        beta = np.r_[float(model.intercept_), beta]
+        names = ["const"] + names
+        X_design = np.c_[np.ones((X_design.shape[0], 1)), X_design]
+
     if force_nonnegative:
         beta = np.maximum(0.0, beta)
-        # Recompute predictions/metrics from clamped beta
-        X_design = np.c_[np.ones((X.shape[0], 1)), X.values] if not add_constant else X.values
-        if add_constant:
-            # our X already contains const as first column
-            yhat = X_design @ beta
-            p = X.shape[1]
-        else:
-            yhat = X_design @ beta
-            p = X_design.shape[1]
-        metrics = _metrics_from_yhat(y.values.astype(float), yhat, p)
-        stderr = pd.Series([np.nan]*len(names), index=names, name="std_err")
-        tvals  = pd.Series([np.nan]*len(names), index=names, name="t")
-        pvals  = pd.Series([np.nan]*len(names), index=names, name="p_value")
-    else:
-        # Use original predictions
-        p = (X.shape[1] if add_constant else X.shape[1] + 1)
-        metrics = _metrics_from_yhat(y.values.astype(float), yhat, p)
-        stderr = pd.Series([np.nan]*len(names), index=names, name="std_err")  # sklearn doesn't give SEs
-        tvals  = pd.Series([np.nan]*len(names), index=names, name="t")
-        pvals  = pd.Series([np.nan]*len(names), index=names, name="p_value")
 
+    yhat = X_design @ beta
+    metrics = _metrics_from_yhat(y.values.astype(float), yhat, p=X_design.shape[1])
     yhat_s = pd.Series(yhat, index=y.index, name="yhat")
     resid_s = pd.Series(y.values - yhat, index=y.index, name="residual")
+
+    # sklearn doesn't provide SE/t/p
+    stderr = pd.Series([np.nan]*len(names), index=names, name="std_err")
+    tvals  = pd.Series([np.nan]*len(names), index=names, name="t")
+    pvals  = pd.Series([np.nan]*len(names), index=names, name="p_value")
     coef_s = pd.Series(beta, index=names, name="coef")
-    vif = compute_vif(X_df) if compute_vif_flag else None
+    vif = compute_vif(X) if compute_vif_flag else None
 
     return {
         "coef": coef_s, "stderr": stderr, "tvalues": tvals, "pvalues": pvals,
-        "yhat": yhat_s, "residuals": resid_s,
-        "metrics": metrics, "vif": vif,
+        "yhat": yhat_s, "residuals": resid_s, "metrics": metrics, "vif": vif,
     }
 
 
@@ -284,10 +267,7 @@ def ridge_model(X_df: pd.DataFrame, y: pd.Series, alpha: float = 1.0,
     if not _HAVE_SKLEARN:
         raise RuntimeError("scikit-learn not installed")
     from sklearn.linear_model import Ridge
-    try:
-        mdl = Ridge(alpha=alpha, fit_intercept=not add_constant)
-    except Exception:
-        mdl = Ridge(alpha=alpha)
+    mdl = Ridge(alpha=alpha)
     return _wrap_sklearn_linear(mdl, X_df, y, add_constant, compute_vif_flag, force_nonnegative)
 
 
@@ -297,10 +277,7 @@ def lasso_model(X_df: pd.DataFrame, y: pd.Series, alpha: float = 1.0,
     if not _HAVE_SKLEARN:
         raise RuntimeError("scikit-learn not installed")
     from sklearn.linear_model import Lasso
-    try:
-        mdl = Lasso(alpha=alpha, fit_intercept=not add_constant, max_iter=10000, positive=False)
-    except Exception:
-        mdl = Lasso(alpha=alpha, max_iter=10000)
+    mdl = Lasso(alpha=alpha, max_iter=10000)
     return _wrap_sklearn_linear(mdl, X_df, y, add_constant, compute_vif_flag, force_nonnegative)
 
 
@@ -314,8 +291,7 @@ def _carryover_fraction(alpha: float, K: int) -> float:
         return 0.0
     num = a * (1.0 - a**K) / (1.0 - a) if a != 1.0 else float(K)
     den = (1.0 - a**(K+1)) / (1.0 - a) if a != 1.0 else float(K+1)
-    frac = num / den if den != 0 else 0.0
-    return float(np.clip(frac, 0.0, 1.0))
+    return float(np.clip((num / den) if den != 0 else 0.0, 0.0, 1.0))
 
 
 def _meta_lookup_alphaK(feature_name: str, transforms_meta: Optional[Dict[str, Any]]) -> Tuple[float, int]:
@@ -387,11 +363,10 @@ def impact_decomposition(y: pd.Series,
     if transforms_meta is not None and len(contrib_s) > 0:
         for col, cval in contrib_s.items():
             a, K = _meta_lookup_alphaK(col, transforms_meta)
-            frac = _carryover_fraction(a, K)
-            carryover_total += cval * frac
+            carryover_total += cval * _carryover_fraction(a, K)
     carryover_pct = float((carryover_total / denom) * 100.0) if denom > 0 else 0.0
 
-    res = {
+    return {
         "base_pct": float((base_total / denom) * 100.0) if denom > 0 else 0.0,
         "carryover_pct": carryover_pct,
         "incremental_pct": float((inc_total / denom) * 100.0) if denom > 0 else 0.0,
@@ -399,4 +374,3 @@ def impact_decomposition(y: pd.Series,
         "per_feature_contrib": contrib_s,
         "denominator_total": denom,
     }
-    return res
