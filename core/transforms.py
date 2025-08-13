@@ -10,11 +10,6 @@ from typing import Dict, Any, List, Tuple, Optional
 def to_num(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
-def _nan_to_zero(a: np.ndarray) -> np.ndarray:
-    a = np.asarray(a, dtype=float)
-    a[~np.isfinite(a)] = 0.0
-    return a
-
 # ---------------------------
 # Curves & suggestions
 # ---------------------------
@@ -44,7 +39,7 @@ def suggest_k(series: pd.Series, tfm: str) -> float:
     Suggest curvature k from data.
       - Log:     k ≈ 1 / mean(x_pos)
       - NegExp:  k ≈ ln(2) / mean(x_pos)   (half-saturation at mean)
-    Falls back to 0.01 if mean<=0 or empty.
+    Fallback: 0.01
     """
     s = to_num(series)
     s = s[s > 0]
@@ -161,7 +156,6 @@ def apply_with_order(
       - 'Adstock+Lag→Transform'
     Scaling is applied at the end.
     """
-    # numeric & guards
     K = int(max(0, lag_months))
     a = float(np.clip(adstock_alpha, 0.0, 1.0))
     x_num = to_num(x).fillna(0.0)
@@ -171,7 +165,6 @@ def apply_with_order(
 
     t = (transform or "none").strip().lower()
     if order.startswith("Transform"):
-        # Transform on raw values, then adstock on transformed series
         if t in ("log", "logarithm", "logarithmic"):
             base = transform_log(x_num, k)
         elif t in ("negexp", "negative_exponential", "neg_exp"):
@@ -180,7 +173,6 @@ def apply_with_order(
             base = transform_none(x_num, 0.0)
         out = adstock_finite(base, a, K)
     else:
-        # Adstock first, then transform
         if t in ("log", "logarithm", "logarithmic"):
             out = transform_log(x_ad, k)
         elif t in ("negexp", "negative_exponential", "neg_exp"):
@@ -190,7 +182,7 @@ def apply_with_order(
 
     out = to_num(out).fillna(0.0)
 
-    # Apply scaling
+    # scaling last
     scaling = (scaling or "None").strip()
     scaler = SCALERS.get(scaling, scale_none)
     if scaler is scale_minmax:
@@ -201,7 +193,7 @@ def apply_with_order(
     return out
 
 # ---------------------------
-# Vectorized apply for multiple metrics using a config list
+# Bulk apply
 # ---------------------------
 def apply_bulk(
     df: pd.DataFrame,
