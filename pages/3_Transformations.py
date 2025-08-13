@@ -14,12 +14,13 @@ st.title("🧪 Transformations")
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ---------------------------------
+# ---------------------------
 # Utilities
-# ---------------------------------
+# ---------------------------
 def _list_csvs() -> List[str]:
     return sorted([f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")])
 
+@st.cache_data(show_spinner=False)
 def _read_csv(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
@@ -47,9 +48,9 @@ def _cfg_key(dataset: str) -> str:
 def _default_order() -> str:
     return "Transform→Adstock+Lag"
 
-# ---------------------------------
+# ---------------------------
 # Dataset pick
-# ---------------------------------
+# ---------------------------
 files = _list_csvs()
 if not files:
     st.info("No CSVs in `data/` yet. Upload files in **Data Upload**.")
@@ -60,9 +61,14 @@ df_raw = _read_csv(os.path.join(DATA_DIR, dataset))
 
 st.caption(f"Rows: {len(df_raw):,} • Columns: {len(df_raw.columns)}")
 
-# ---------------------------------
+# If dataset changed, clear any stale config
+if st.session_state.get("tfm_last_dataset") != dataset:
+    st.session_state.pop(_cfg_key(st.session_state.get("tfm_last_dataset","")), None)
+    st.session_state["tfm_last_dataset"] = dataset
+
+# ---------------------------
 # Identify columns
-# ---------------------------------
+# ---------------------------
 all_cols = list(df_raw.columns)
 num_cols = [c for c in all_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
 
@@ -101,9 +107,9 @@ with st.expander("📎 Key columns", expanded=True):
             else:
                 st.warning("No valid dates found for time filtering.")
 
-# ---------------------------------
+# ---------------------------
 # Candidate metrics (exclude key columns)
-# ---------------------------------
+# ---------------------------
 exclude = set([c for c in (time_col, id_col, target_col, segment_col) if c and c != "— (none)"])
 metric_cols = [c for c in df_raw.columns
                if pd.api.types.is_numeric_dtype(df_raw[c])
@@ -111,9 +117,9 @@ metric_cols = [c for c in df_raw.columns
 
 st.write(f"**Transformable metrics (numeric):** {len(metric_cols)}")
 
-# ---------------------------------
-# Build or upgrade config table in session
-# ---------------------------------
+# ---------------------------
+# Build or upgrade config (ONE-TIME INIT; no mid-typing resets)
+# ---------------------------
 cfg_key = _cfg_key(dataset)
 required_cols = [
     "use","metric","transform","k","suggested_k",
@@ -121,7 +127,7 @@ required_cols = [
     "scaling","scale_min","scale_max"
 ]
 
-def _empty_defaults_for_metric(m: str, df: pd.DataFrame) -> Dict[str, Any]:
+def _defaults_for_metric(m: str, df: pd.DataFrame) -> Dict[str, Any]:
     s = pd.to_numeric(df[m], errors="coerce").dropna()
     skew = float(s.skew()) if len(s) > 2 else 0.0
     tfm_default = "Log" if skew > 1.0 else "NegExp"
@@ -141,11 +147,10 @@ def _empty_defaults_for_metric(m: str, df: pd.DataFrame) -> Dict[str, Any]:
     }
 
 if cfg_key not in st.session_state:
-    st.session_state[cfg_key] = pd.DataFrame([_empty_defaults_for_metric(m, df_raw) for m in metric_cols])
+    st.session_state[cfg_key] = pd.DataFrame([_defaults_for_metric(m, df_raw) for m in metric_cols])
 else:
     cfg_df = st.session_state[cfg_key].copy()
-
-    # Ensure required columns exist (upgrade older session configs)
+    # ensure columns exist (upgrade)
     for col in required_cols:
         if col not in cfg_df.columns:
             if col == "scaling":
@@ -161,105 +166,107 @@ else:
             elif col == "order":
                 cfg_df[col] = _default_order()
             else:
-                # safe default
                 cfg_df[col] = 0.0
-
-    # Add any new metrics that appeared
+    # add any new metrics
     known = set(cfg_df["metric"])
-    new_rows = []
-    for m in metric_cols:
-        if m not in known:
-            new_rows.append(_empty_defaults_for_metric(m, df_raw))
-    if new_rows:
-        cfg_df = pd.concat([cfg_df, pd.DataFrame(new_rows)], ignore_index=True)
-
-    # Keep only metrics still present
+    if any(m not in known for m in metric_cols):
+        add_rows = [ _defaults_for_metric(m, df_raw) for m in metric_cols if m not in known ]
+        cfg_df = pd.concat([cfg_df, pd.DataFrame(add_rows)], ignore_index=True)
+    # keep only present metrics, but DO NOT overwrite user edits elsewhere
     cfg_df = cfg_df[cfg_df["metric"].isin(metric_cols)].reset_index(drop=True)
     st.session_state[cfg_key] = cfg_df
 
 cfg_df = st.session_state[cfg_key]
 
-# ---------------------------------
-# Editor
-# ---------------------------------
+# ---------------------------
+# EDITOR inside a FORM (buffers edits; no rerun on every keystroke)
+# ---------------------------
 st.markdown("#### Configure transformations & scaling")
 st.caption(
-    "Set **Transform** to **None** for no transformation. "
-    "Set **Scaling** to **None** for no scaling. "
-    "For **MinMax**, `scale_min/scale_max` are used. "
-    "Curvature **k** applies to Log/NegExp."
+    "Set **Transform** to **None** for no transformation; **Scaling** to **None** for no scaling. "
+    "Curvature **k** applies to Log/NegExp. Edits are applied when you click **Commit edits**."
 )
+with st.form("tfm_form", clear_on_submit=False):
+    edited_df = st.data_editor(
+        cfg_df,
+        key=f"cfg_editor::{dataset}",
+        use_container_width=True,
+        num_rows="fixed",
+        row_height=30,
+        hide_index=True,
+        column_config={
+            "use": st.column_config.CheckboxColumn("Use"),
+            "metric": st.column_config.TextColumn("Metric", disabled=True),
+            "transform": st.column_config.SelectboxColumn("Transform", options=["None","Log","NegExp"]),
+            "k": st.column_config.NumberColumn("k (curvature)", help="Shape parameter for Log/NegExp."),
+            "suggested_k": st.column_config.NumberColumn("k (suggested)", disabled=True),
+            "lag_months": st.column_config.NumberColumn("Lag (months)", min_value=0, step=1,
+                                                        help="K in finite adstock (number of past periods to include)."),
+            "adstock_alpha": st.column_config.NumberColumn("Adstock α (0–1)", min_value=0.0, max_value=1.0, step=0.05,
+                                                           help="Decay; Effective_t = x_t + αx_{t-1} + … + α^K x_{t-K}"),
+            "order": st.column_config.SelectboxColumn("Order", options=["Transform→Adstock+Lag","Adstock+Lag→Transform"]),
+            "scaling": st.column_config.SelectboxColumn(
+                "Scaling",
+                options=[
+                    "None",
+                    "MinMax",
+                    "Standardize (z-score)",
+                    "Robust (median/IQR)",
+                    "Mean norm (÷ mean)",
+                    "Max norm (÷ max)",
+                    "Unit length (L2)",
+                ],
+            ),
+            "scale_min": st.column_config.NumberColumn("scale_min (MinMax)"),
+            "scale_max": st.column_config.NumberColumn("scale_max (MinMax)"),
+        },
+        # KEEP VALUES STABLE ACROSS RERUNS:
+        column_order=[
+            "use","metric","transform","k","suggested_k",
+            "lag_months","adstock_alpha","order",
+            "scaling","scale_min","scale_max"
+        ],
+        # Use a stable row key so edits don't jump/reset:
+        disabled=False
+    )
 
-edited_cfg = st.data_editor(
-    cfg_df,
-    key=f"cfg_editor::{dataset}",
-    use_container_width=True,
-    num_rows="fixed",
-    column_config={
-        "use": st.column_config.CheckboxColumn("Use"),
-        "metric": st.column_config.TextColumn("Metric", disabled=True),
-        "transform": st.column_config.SelectboxColumn(
-            "Transform", options=["None","Log","NegExp"]
-        ),
-        "k": st.column_config.NumberColumn("k (curvature)", help="Shape parameter for Log/NegExp."),
-        "suggested_k": st.column_config.NumberColumn("k (suggested)", disabled=True),
-        "lag_months": st.column_config.NumberColumn("Lag (months)", min_value=0, step=1,
-                                                    help="K in finite adstock."),
-        "adstock_alpha": st.column_config.NumberColumn("Adstock α (0–1)", min_value=0.0, max_value=1.0, step=0.05,
-                                                       help="Decay; Effective_t = x_t + αx_{t-1} + … + α^K x_{t-K}"),
-        "order": st.column_config.SelectboxColumn(
-            "Order", options=["Transform→Adstock+Lag","Adstock+Lag→Transform"]
-        ),
-        "scaling": st.column_config.SelectboxColumn(
-            "Scaling",
-            options=[
-                "None",
-                "MinMax",
-                "Standardize (z-score)",
-                "Robust (median/IQR)",
-                "Mean norm (÷ mean)",
-                "Max norm (÷ max)",
-                "Unit length (L2)",
-            ],
-        ),
-        "scale_min": st.column_config.NumberColumn("scale_min (MinMax)"),
-        "scale_max": st.column_config.NumberColumn("scale_max (MinMax)"),
-    }
-)
+    b1, b2, b3 = st.columns([1,1,2])
+    with b1:
+        do_commit = st.form_submit_button("✅ Commit edits", use_container_width=True)
+    with b2:
+        do_apply_k = st.form_submit_button("🔄 Apply suggested k", use_container_width=True)
+    with b3:
+        st.caption("Edits aren’t applied until you click **Commit edits**.")
 
-c1, c2, c3 = st.columns([1,1,2])
-with c1:
-    if st.button("🔄 Apply suggested k", use_container_width=True):
-        tmp = edited_cfg.copy()
-        for i, row in tmp.iterrows():
-            tfm = str(row.get("transform", "None"))
-            if tfm in ("Log","NegExp"):
-                s = pd.to_numeric(df_raw[row["metric"]], errors="coerce")
-                ksug = _suggest_k_for_series(s, tfm)
-                tmp.at[i, "k"] = round(ksug, 6)
-                tmp.at[i, "suggested_k"] = round(ksug, 6)
-        st.session_state[cfg_key] = tmp
-        st.rerun()
-with c2:
-    if st.button("Reset all", help="Reset to fresh suggestions.", use_container_width=True):
-        st.session_state.pop(cfg_key, None)
-        st.rerun()
-with c3:
-    st.caption("Tip: Choose **None** for Transform/Scaling to pass the metric unchanged (except adstock/lag if set).")
+# Handle form actions (these trigger a single rerun each)
+if do_apply_k:
+    tmp = edited_df.copy()
+    for i, row in tmp.iterrows():
+        tfm = str(row.get("transform","None"))
+        if tfm in ("Log","NegExp"):
+            s = pd.to_numeric(df_raw[row["metric"]], errors="coerce")
+            ksug = _suggest_k_for_series(s, tfm)
+            tmp.at[i, "k"] = round(ksug, 6)
+            tmp.at[i, "suggested_k"] = round(ksug, 6)
+    st.session_state[cfg_key] = tmp
+    st.toast("Suggested k applied.")
+elif do_commit:
+    st.session_state[cfg_key] = edited_df.copy()
+    st.toast("Edits committed.")
 
-# Persist edits
-st.session_state[cfg_key] = edited_cfg
+# Always work off the committed config
+cfg_df = st.session_state[cfg_key].copy()
 
-# ---------------------------------
-# Preview
-# ---------------------------------
+# ---------------------------
+# Preview (reads COMMITTED config only)
+# ---------------------------
 st.markdown("#### Preview")
-prev_cols = [r["metric"] for _, r in edited_cfg.iterrows() if r.get("use", True)]
+prev_cols = [r["metric"] for _, r in cfg_df.iterrows() if r.get("use", True)]
 if not prev_cols:
-    st.info("Select at least one metric (Use = ✓) to preview.")
+    st.info("Select at least one metric (Use = ✓) and **Commit edits** to preview.")
 else:
-    preview_metric = st.selectbox("Pick a metric to preview", options=prev_cols)
-    row = edited_cfg[edited_cfg["metric"] == preview_metric].iloc[0]
+    preview_metric = st.selectbox("Pick a metric to preview", options=prev_cols, key="tfm_preview_metric")
+    row = cfg_df[cfg_df["metric"] == preview_metric].iloc[0]
     tfm = str(row["transform"])
     k = float(row["k"])
     lag = int(row["lag_months"])
@@ -291,14 +298,14 @@ else:
         plot_df = pd.DataFrame({"idx": np.arange(len(raw)), "Original": raw, "Transformed+Scaled": eff}).set_index("idx")
     st.line_chart(plot_df)
 
-# ---------------------------------
-# Apply & Save
-# ---------------------------------
+# ---------------------------
+# Apply & Save (uses COMMITTED config only)
+# ---------------------------
 st.divider()
 st.markdown("#### Save transformed dataset")
 
 cfg_rows = []
-for _, r in edited_cfg.iterrows():
+for _, r in cfg_df.iterrows():
     if bool(r.get("use", True)):
         cfg_rows.append({
             "metric": str(r["metric"]),
