@@ -289,7 +289,7 @@ else:
 # -------------------------
 st.markdown(
     "<div class='small-note' style='margin-top:10px; text-align:right;'>"
-    "built by <strong>BLUE MATTEr</strong>"
+    "built by <strong>BLUE MATTER</strong>"
     "</div>",
     unsafe_allow_html=True
 )
