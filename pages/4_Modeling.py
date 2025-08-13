@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from core import modeling
 
-st.title("📈 Modeling — Batch Runner with Impactable %")
+st.title("📈 Modeling — Batch Runner (NNLS option)")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -28,9 +28,7 @@ def _has_sklearn() -> bool:
         return False
 
 def _load_transforms_meta(dataset_csv: str) -> Optional[Dict[str, Any]]:
-    """
-    Loads transforms_<dataset_stem>.json if present, so we can estimate Carryover %.
-    """
+    """Load transforms_<dataset_stem>.json if present (for Carryover %)."""
     stem = os.path.splitext(dataset_csv)[0]
     meta_path = os.path.join(DATA_DIR, f"transforms_{stem}.json")
     if os.path.exists(meta_path):
@@ -71,7 +69,7 @@ with c2:
     compute_vif = st.checkbox("Compute VIF", value=True, help="Check multicollinearity among features.")
 with c3:
     force_nonneg = st.checkbox("Force negative estimates to 0", value=True,
-                               help="When ON, coefficients are constrained to be non-negative (NNLS or clamped), and all metrics use the constrained predictions.")
+                               help="When ON: use NNLS (if available) or clamp to ≥0; metrics come from constrained predictions.")
 with c4:
     have_sklearn = _has_sklearn()
     st.caption(("scikit-learn detected ✓" if have_sklearn else "scikit-learn not available — OLS only"))
@@ -192,7 +190,7 @@ if st.button("🚀 Run all models", disabled=not st.session_state["model_queue"]
                             force_nonnegative=force_nonneg
                         )
                 except Exception:
-                    # Safe fallback
+                    # Safe fallback → OLS
                     res = modeling.ols_model(
                         X_df, y,
                         add_constant=spec["add_const"],
