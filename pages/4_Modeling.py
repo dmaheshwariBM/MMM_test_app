@@ -64,12 +64,15 @@ target_default_idx = numeric_cols.index(default_target) if default_target in num
 )
 
 # ---------- Global options ----------
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     add_const = st.checkbox("Add intercept (const)", value=True)
 with c2:
     compute_vif = st.checkbox("Compute VIF", value=True, help="Check multicollinearity among features.")
 with c3:
+    force_nonneg = st.checkbox("Force negative estimates to 0", value=True,
+                               help="When ON, coefficients are constrained to be non-negative (NNLS or clamped), and all metrics use the constrained predictions.")
+with c4:
     have_sklearn = _has_sklearn()
     st.caption(("scikit-learn detected ✓" if have_sklearn else "scikit-learn not available — OLS only"))
 
@@ -159,25 +162,48 @@ if st.button("🚀 Run all models", disabled=not st.session_state["model_queue"]
             # Fit
             mtype = spec["type"]
             if mtype == "OLS":
-                res = modeling.ols_model(X_df, y, add_constant=spec["add_const"], compute_vif_flag=spec["compute_vif"])
+                res = modeling.ols_model(
+                    X_df, y,
+                    add_constant=spec["add_const"],
+                    compute_vif_flag=spec["compute_vif"],
+                    force_nonnegative=force_nonneg
+                )
             else:
                 try:
                     if mtype == "Ridge":
-                        res = modeling.ridge_model(X_df, y, alpha=spec["alpha"] or 1.0,
-                                                   add_constant=spec["add_const"], compute_vif_flag=spec["compute_vif"])
+                        res = modeling.ridge_model(
+                            X_df, y, alpha=spec["alpha"] or 1.0,
+                            add_constant=spec["add_const"],
+                            compute_vif_flag=spec["compute_vif"],
+                            force_nonnegative=force_nonneg
+                        )
                     elif mtype == "Lasso":
-                        res = modeling.lasso_model(X_df, y, alpha=spec["alpha"] or 1.0,
-                                                   add_constant=spec["add_const"], compute_vif_flag=spec["compute_vif"])
+                        res = modeling.lasso_model(
+                            X_df, y, alpha=spec["alpha"] or 1.0,
+                            add_constant=spec["add_const"],
+                            compute_vif_flag=spec["compute_vif"],
+                            force_nonnegative=force_nonneg
+                        )
                     else:
-                        res = modeling.ols_model(X_df, y, add_constant=spec["add_const"], compute_vif_flag=spec["compute_vif"])
+                        res = modeling.ols_model(
+                            X_df, y,
+                            add_constant=spec["add_const"],
+                            compute_vif_flag=spec["compute_vif"],
+                            force_nonnegative=force_nonneg
+                        )
                 except Exception:
                     # Safe fallback
-                    res = modeling.ols_model(X_df, y, add_constant=spec["add_const"], compute_vif_flag=spec["compute_vif"])
+                    res = modeling.ols_model(
+                        X_df, y,
+                        add_constant=spec["add_const"],
+                        compute_vif_flag=spec["compute_vif"],
+                        force_nonnegative=force_nonneg
+                    )
 
             # Decomposition (Base %, Carryover %, Impactable % by channel)
             decomp = modeling.impact_decomposition(
                 y=y, yhat=res["yhat"], coef=res["coef"], X_df=X_df,
-                add_constant=spec["add_const"], transforms_meta=transforms_meta
+                add_constant=spec["add_const"], transforms_meta=_load_transforms_meta(spec["dataset"])
             )
 
             st.session_state["model_results"][spec["id"]] = {
@@ -241,6 +267,9 @@ if st.session_state["model_results"]:
 
             coef_df = pd.concat([res["coef"], res["stderr"], res["tvalues"], res["pvalues"]], axis=1)
             coef_df.columns = ["coef", "std_err", "t", "p_value"]
+            if force_nonneg:
+                st.info("Non-negative constraint is ON: std_err / t / p_value are not shown (NaN).")
+
             st.markdown("**Coefficients**")
             st.dataframe(coef_df.style.format(precision=6), use_container_width=True)
 
