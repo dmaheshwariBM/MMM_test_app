@@ -349,3 +349,4 @@ if st.session_state["model_results"]:
                     file_name=f"{spec['name'].replace(' ','_')}_results.zip",
                     mime="application/zip"
                 )
+st.success(f"Ran {len(st.session_state['model_results'])} model(s).")
