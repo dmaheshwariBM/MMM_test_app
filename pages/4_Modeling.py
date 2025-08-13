@@ -350,3 +350,44 @@ if st.session_state["model_results"]:
                     mime="application/zip"
                 )
 st.success(f"Ran {len(st.session_state['model_results'])} model(s).")
+# --- Persist batch results to disk (Results page will read these) ---
+import json, re
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+def _safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
+
+batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+batch_dir = os.path.join(RESULTS_DIR, batch_ts)
+os.makedirs(batch_dir, exist_ok=True)
+
+for _, blob in st.session_state["model_results"].items():
+    spec = blob["spec"]; res = blob["result"]; dc = blob["decomp"]
+    record = {
+        "batch_ts": batch_ts,
+        "dataset": spec["dataset"],
+        "model_id": spec["id"],
+        "name": spec["name"],
+        "type": spec["type"],
+        "target": spec["target"],
+        "features": spec["features"],
+        "add_const": bool(spec.get("add_const", True)),
+        "compute_vif": bool(spec.get("compute_vif", True)),
+        # Key metrics
+        "metrics": res["metrics"],
+        # Decomposition
+        "base_pct": float(dc["base_pct"]),
+        "carryover_pct": float(dc["carryover_pct"]),
+        "incremental_pct": float(dc["incremental_pct"]),
+        "impactable_pct": {k: float(v) for k, v in dc["impactable_pct"].to_dict().items()},
+        # Minimal preview of coefficients (handy in results)
+        "coef": {k: float(v) for k, v in res["coef"].to_dict().items()},
+        # Info to help later pages (optional)
+        "n_rows": int(res["metrics"].get("n", 0)),
+    }
+    fname = f"{batch_ts}__{_safe(spec['name'])}__{_safe(spec['target'])}.json"
+    with open(os.path.join(batch_dir, fname), "w") as f:
+        json.dump(record, f, indent=2)
+
+st.toast(f"Saved batch to {batch_dir}")
