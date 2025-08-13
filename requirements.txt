@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+plotly
+duckdb
+scikit-learn
+statsmodels
+scipy
+openpyxl
+snowflake-connector-python
+pyyaml
+Pillow
