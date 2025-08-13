@@ -351,43 +351,88 @@ if st.session_state["model_results"]:
                 )
 st.success(f"Ran {len(st.session_state['model_results'])} model(s).")
 # --- Persist batch results to disk (Results page will read these) ---
-import json, re
+import json, re, glob
+
 RESULTS_DIR = "results"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
 
+def _existing_model_names(results_dir: str) -> set:
+    """Collect all previously saved model names (case-insensitive)."""
+    names = set()
+    for jf in glob.glob(os.path.join(results_dir, "*", "*.json")):
+        try:
+            with open(jf, "r") as f:
+                rec = json.load(f)
+            nm = str(rec.get("name", "")).strip().lower()
+            if nm:
+                names.add(nm)
+        except Exception:
+            continue
+    return names
+
+# Guard against duplicate saves from Streamlit re-runs.
+# We'll stamp this batch once and skip if already persisted this run.
+if "persisted_run_token" not in st.session_state:
+    st.session_state["persisted_run_token"] = set()
+
+run_token = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+if run_token in st.session_state["persisted_run_token"]:
+    st.stop()
+st.session_state["persisted_run_token"].add(run_token)
+
+existing_names = _existing_model_names(RESULTS_DIR)
+
 batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 batch_dir = os.path.join(RESULTS_DIR, batch_ts)
 os.makedirs(batch_dir, exist_ok=True)
 
+saved_count = 0
+skipped = []
+
 for _, blob in st.session_state["model_results"].items():
     spec = blob["spec"]; res = blob["result"]; dc = blob["decomp"]
+
+    model_name = (spec.get("name") or "").strip()
+    if not model_name:
+        continue
+
+    # Skip if this model name already exists in ANY previous saved run
+    if model_name.lower() in existing_names:
+        skipped.append(model_name)
+        continue
+
     record = {
         "batch_ts": batch_ts,
-        "dataset": spec["dataset"],
-        "model_id": spec["id"],
-        "name": spec["name"],
-        "type": spec["type"],
-        "target": spec["target"],
-        "features": spec["features"],
+        "dataset": spec.get("dataset"),
+        "model_id": spec.get("id"),
+        "name": model_name,
+        "type": spec.get("type"),
+        "target": spec.get("target"),
+        "features": spec.get("features", []),
         "add_const": bool(spec.get("add_const", True)),
         "compute_vif": bool(spec.get("compute_vif", True)),
         # Key metrics
-        "metrics": res["metrics"],
+        "metrics": res.get("metrics", {}),
         # Decomposition
-        "base_pct": float(dc["base_pct"]),
-        "carryover_pct": float(dc["carryover_pct"]),
-        "incremental_pct": float(dc["incremental_pct"]),
-        "impactable_pct": {k: float(v) for k, v in dc["impactable_pct"].to_dict().items()},
-        # Minimal preview of coefficients (handy in results)
-        "coef": {k: float(v) for k, v in res["coef"].to_dict().items()},
-        # Info to help later pages (optional)
-        "n_rows": int(res["metrics"].get("n", 0)),
+        "base_pct": float(dc.get("base_pct", 0.0)),
+        "carryover_pct": float(dc.get("carryover_pct", 0.0)),
+        "incremental_pct": float(dc.get("incremental_pct", 0.0)),
+        "impactable_pct": {k: float(v) for k, v in (dc.get("impactable_pct", pd.Series(dtype=float))).to_dict().items()} if hasattr(dc.get("impactable_pct"), "to_dict") else dc.get("impactable_pct", {}),
+        # Coefs (minimal preview)
+        "coef": {k: float(v) for k, v in (res.get("coef", pd.Series(dtype=float))).to_dict().items()} if hasattr(res.get("coef"), "to_dict") else res.get("coef", {}),
+        "n_rows": int(res.get("metrics", {}).get("n", 0)),
     }
-    fname = f"{batch_ts}__{_safe(spec['name'])}__{_safe(spec['target'])}.json"
+
+    fname = f"{batch_ts}__{_safe(model_name)}__{_safe(spec.get('target',''))}.json"
     with open(os.path.join(batch_dir, fname), "w") as f:
         json.dump(record, f, indent=2)
+    existing_names.add(model_name.lower())  # avoid dup within same batch
+    saved_count += 1
 
-st.toast(f"Saved batch to {batch_dir}")
+msg = f"Saved {saved_count} new model(s) to {batch_dir}."
+if skipped:
+    msg += " Skipped duplicates: " + ", ".join(skipped[:5]) + ("…" if len(skipped) > 5 else "")
+st.toast(msg)
