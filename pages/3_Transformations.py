@@ -1,8 +1,10 @@
+# pages/3_Transformations.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import os
 import json
+import traceback
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 from core import transforms, io
@@ -161,6 +163,7 @@ def _curve_preview_df(x: np.ndarray, transform: str, beta: float, gamma: float) 
         y_cann = y_base * np.exp(-gamma * 1.0)  # pool=1 for intuition
         return pd.DataFrame({"x": x, "NegExp (base)": y_base, "With Cannibalization": y_cann}).set_index("x")
     return pd.DataFrame({"x": x, "None": x}).set_index("x")
+
 # =========================
 # Dataset & keys
 # =========================
@@ -180,22 +183,34 @@ time_col = st.selectbox("Time column", [None] + cols_all, index=(cols_all.index(
 id_col = st.selectbox("ID column (e.g., HCP_ID)", [None] + cols_all, index=(cols_all.index("HCP_ID")+1 if "HCP_ID" in cols_all else 0))
 seg_col = st.selectbox("Segment column (optional)", [None] + cols_all, index=0)
 
-# Time window filter
+# =========================
+# Time window filter (AVAILABLE MONTHS ONLY)
+# =========================
 df = df0.copy()
 if time_col:
     try:
-        dt = pd.to_datetime(df[time_col], errors="coerce")
-        min_dt, max_dt = dt.min(), dt.max()
-        c1, c2 = st.columns(2)
-        with c1:
-            start_date = st.date_input("Start date", value=min_dt.date() if pd.notna(min_dt) else None, key=f"tfm_start_{dataset}")
-        with c2:
-            end_date = st.date_input("End date", value=max_dt.date() if pd.notna(max_dt) else None, key=f"tfm_end_{dataset}")
-        if start_date and end_date:
-            mask = (dt >= pd.to_datetime(start_date)) & (dt <= pd.to_datetime(end_date))
-            df = df.loc[mask].copy()
+        dt_all = pd.to_datetime(df0[time_col], errors="coerce")
+        months_all = dt_all.dt.to_period("M")
+        month_labels = sorted({p.strftime("%Y-%m") for p in months_all.dropna()})
+
+        if month_labels:
+            # Only allow selecting months that exist in the data
+            start_label, end_label = st.select_slider(
+                "Time window (available months only)",
+                options=month_labels,
+                value=(month_labels[0], month_labels[-1]),
+                key=f"timewin_{dataset}",
+            )
+            # Build mask against all rows (tolerate NaT)
+            month_str = months_all.astype(str)
+            mask = months_all.notna() & (month_str >= start_label) & (month_str <= end_label)
+            df = df0.loc[mask].copy()
+            st.caption(f"Filtered to **{start_label} → {end_label}** • Rows: {len(df):,}")
+
             if df.empty:
-                st.warning("Selected date window has no rows after filtering.")
+                st.warning("This selection returned no rows. Pick another window from the available options above.")
+        else:
+            st.error(f"No parseable months found in `{time_col}`. Fix typing on the Upload page.")
     except Exception as e:
         st.warning(f"Time filter not applied: {e}")
 
@@ -256,7 +271,7 @@ with st.form(key=f"tfm_form_{dataset}", clear_on_submit=False):
         key=f"tfm_editor_{dataset}",
     )
 
-    # Which rows need beta?
+    # β sliders (only for rows using NegExp/NegExp+Cannibalization)
     needs_beta_metrics = edited_cfg.loc[edited_cfg["transform"].isin(["NegExp", "NegExp+Cannibalization"]), "metric"].tolist()
     if needs_beta_metrics:
         st.markdown("**β (per-metric) for Negative Exponential**")
@@ -293,7 +308,7 @@ with st.form(key=f"tfm_form_{dataset}", clear_on_submit=False):
         state["saved_gamma"] = float(state["pending_gamma"])
         st.success("Config saved ✓")
 
-# Helpful guide (outside the form)
+# ---------- Guide ----------
 with st.expander("📘 Transform Guide (math & intuition)", expanded=False):
     st.markdown(r"""
 **Finite Adstocked Lag (this app):**  
@@ -307,7 +322,7 @@ with st.expander("📘 Transform Guide (math & intuition)", expanded=False):
 **NegExp+Cannibalization:** \( y = (1 - e^{-\beta x}) \cdot e^{-\gamma \cdot \text{pool}} \)
 """)
 
-# Coercion report for the SAVED cfg
+# Coercion report (SAVED cfg)
 need_numeric_cols = state["saved_cfg"].loc[state["saved_cfg"]["transform"].isin(list(NUMERIC_REQUIRED)), "metric"].tolist()
 if need_numeric_cols:
     report = _coerce_numeric_report(df, need_numeric_cols)
@@ -369,6 +384,8 @@ with left:
             st.dataframe(df_prev.head(preview_n), use_container_width=True)
         except Exception as e:
             st.error(f"Preview failed: {e}")
+            st.exception(e)
+            st.code(traceback.format_exc())
 
 with right:
     if st.button("💾 Save transformed dataset", key=f"btn_save_{dataset}"):
@@ -398,3 +415,5 @@ with right:
             st.success(f"Saved: `{out_csv}` in `data/`. Ready for Modeling.")
         except Exception as e:
             st.error(f"Save failed: {e}")
+            st.exception(e)
+            st.code(traceback.format_exc())
