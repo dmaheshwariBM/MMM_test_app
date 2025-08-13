@@ -7,9 +7,9 @@ from typing import Tuple, Dict, Any, List, Optional
 # Optional p-values (SciPy). Safe if unavailable.
 try:
     from scipy import stats as _scistats  # type: ignore
-    _HAVE_SCIPY = True
+    _HAVE_SCIPY_STATS = True
 except Exception:
-    _HAVE_SCIPY = False
+    _HAVE_SCIPY_STATS = False
 
 # Optional scikit-learn (for Ridge/Lasso). Code still works without it.
 try:
@@ -56,13 +56,36 @@ def prepare_xy(df: pd.DataFrame, target: str, features: List[str], fillna: float
 
 
 # ----------------------------
-# OLS (closed form)
+# Core metrics helpers
 # ----------------------------
 def _add_const(X: np.ndarray) -> np.ndarray:
     return np.hstack([np.ones((X.shape[0], 1)), X])
 
 
-def _ols_closed_form(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, float]]:
+def _metrics_from_yhat(y: np.ndarray, yhat: np.ndarray, p: int) -> Dict[str, float]:
+    n = len(y)
+    resid = y - yhat
+    sse = float(np.sum(resid ** 2))
+    ybar = float(np.mean(y)) if n > 0 else 0.0
+    sst = float(np.sum((y - ybar) ** 2))
+    r2 = np.nan if sst == 0 else 1.0 - sse / sst
+    adj_r2 = np.nan if (n <= p or np.isnan(r2)) else 1.0 - (1.0 - r2) * (n - 1) / (n - p)
+    rmse = float(np.sqrt(sse / n)) if n > 0 else np.nan
+    mae = float(np.mean(np.abs(resid))) if n > 0 else np.nan
+    mape = float(np.mean(np.abs(resid) / np.maximum(np.abs(y), 1e-12))) if n > 0 else np.nan
+    aic = float(n * np.log(sse / n + 1e-12) + 2 * p) if n > 0 else np.nan
+    bic = float(n * np.log(sse / n + 1e-12) + p * np.log(n + 1e-12)) if n > 0 else np.nan
+    return {
+        "n": n, "p": p, "df_resid": max(n - p, 1),
+        "sse": sse, "sst": sst, "r2": r2, "adj_r2": adj_r2,
+        "rmse": rmse, "mae": mae, "mape": mape, "aic": aic, "bic": bic,
+    }
+
+
+# ----------------------------
+# OLS (unconstrained)
+# ----------------------------
+def _ols_closed_form(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
     yhat = X @ beta
     resid = y - yhat
@@ -88,23 +111,13 @@ def _ols_closed_form(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarr
 
     with np.errstate(divide="ignore", invalid="ignore"):
         tvals = beta / se
-    if _HAVE_SCIPY:
+    if _HAVE_SCIPY_STATS:
         pvals = 2.0 * (1.0 - _scistats.t.cdf(np.abs(tvals), df=df_resid))
     else:
         pvals = np.full(beta.shape, np.nan)
 
-    rmse = float(np.sqrt(sse / n)) if n > 0 else np.nan
-    mae = float(np.mean(np.abs(resid))) if n > 0 else np.nan
-    mape = float(np.mean(np.abs(resid) / np.maximum(np.abs(y), 1e-12))) if n > 0 else np.nan
-    aic = float(n * np.log(sse / n + 1e-12) + 2 * p) if n > 0 else np.nan
-    bic = float(n * np.log(sse / n + 1e-12) + p * np.log(n + 1e-12)) if n > 0 else np.nan
-
-    metrics = {
-        "n": n, "p": p, "df_resid": df_resid,
-        "sse": sse, "sst": sst, "r2": r2, "adj_r2": adj_r2,
-        "rmse": rmse, "mae": mae, "mape": mape, "aic": aic, "bic": bic,
-    }
-    return beta, yhat, {"metrics": metrics, "stderr": se, "tvalues": tvals, "pvalues": pvals, "residuals": resid}
+    metrics = _metrics_from_yhat(y, yhat, p)
+    return beta, yhat, {"metrics": metrics, "stderr": se, "tvalues": tvals, "pvalues": pvals, "residuals": y - yhat}
 
 
 def compute_vif(X_df: pd.DataFrame) -> pd.Series:
@@ -117,7 +130,7 @@ def compute_vif(X_df: pd.DataFrame) -> pd.Series:
         y = X_df.iloc[:, j].values.astype(float)
         X_others = X_df.drop(columns=[cols[j]]).values.astype(float)
         Xo = _add_const(X_others)
-        _, yhat, info = _ols_closed_form(Xo, y)
+        _, yhat, _ = _ols_closed_form(Xo, y)
         resid = y - yhat
         sse = float(np.sum(resid ** 2))
         sst = float(np.sum((y - np.mean(y)) ** 2))
@@ -126,7 +139,20 @@ def compute_vif(X_df: pd.DataFrame) -> pd.Series:
     return pd.Series(vifs, index=cols, name="VIF")
 
 
-def ols_model(X_df: pd.DataFrame, y: pd.Series, add_constant: bool = True, compute_vif_flag: bool = True) -> Dict[str, Any]:
+# ----------------------------
+# OLS (with optional non-negative constraint)
+# ----------------------------
+def ols_model(X_df: pd.DataFrame, y: pd.Series,
+              add_constant: bool = True,
+              compute_vif_flag: bool = True,
+              force_nonnegative: bool = False) -> Dict[str, Any]:
+    """
+    If force_nonnegative=True:
+      - Prefer SciPy NNLS if available for b>=0.
+      - Else fit OLS then clamp negatives to 0.
+      - Recompute yhat & ALL metrics from constrained beta.
+      - std_err / t / p_value are set to NaN (not valid under constraint).
+    """
     y = pd.to_numeric(y, errors="coerce").fillna(0.0)
     X_df = X_df.copy()
     for c in X_df.columns:
@@ -140,34 +166,52 @@ def ols_model(X_df: pd.DataFrame, y: pd.Series, add_constant: bool = True, compu
         X = X_mat
         names = list(X_df.columns)
 
-    beta, yhat, info = _ols_closed_form(X, y.values.astype(float))
-    se = info["stderr"]; tvals = info["tvalues"]; pvals = info["pvalues"]; resid = info["residuals"]
+    if not force_nonnegative:
+        beta, yhat, info = _ols_closed_form(X, y.values.astype(float))
+        coef = pd.Series(beta, index=names, name="coef")
+        stderr = pd.Series(info["stderr"], index=names, name="std_err")
+        tvalues = pd.Series(info["tvalues"], index=names, name="t")
+        pvalues = pd.Series(info["pvalues"], index=names, name="p_value")
+        resid_s = pd.Series(info["residuals"], index=y.index, name="residual")
+        yhat_s = pd.Series(yhat, index=y.index, name="yhat")
+        metrics = info["metrics"]
+    else:
+        # Try SciPy NNLS
+        beta = None
+        try:
+            from scipy.optimize import nnls  # type: ignore
+            beta, _ = nnls(X, y.values.astype(float))
+        except Exception:
+            # Fallback: OLS then clamp
+            beta, _, _ = np.linalg.lstsq(X, y.values.astype(float), rcond=None)
 
-    coef = pd.Series(beta, index=names, name="coef")
-    stderr = pd.Series(se, index=names, name="std_err")
-    tvalues = pd.Series(tvals, index=names, name="t")
-    pvalues = pd.Series(pvals, index=names, name="p_value")
+        beta = np.maximum(0.0, beta)  # ensure non-negative
+        yhat = X @ beta
+        metrics = _metrics_from_yhat(y.values.astype(float), yhat, X.shape[1])
 
-    yhat_s = pd.Series(yhat, index=y.index, name="yhat")
-    resid_s = pd.Series(resid, index=y.index, name="residual")
+        coef = pd.Series(beta, index=names, name="coef")
+        # Under constraint, classic SE/t/p don't apply
+        stderr = pd.Series([np.nan] * len(names), index=names, name="std_err")
+        tvalues = pd.Series([np.nan] * len(names), index=names, name="t")
+        pvalues = pd.Series([np.nan] * len(names), index=names, name="p_value")
+        yhat_s = pd.Series(yhat, index=y.index, name="yhat")
+        resid_s = pd.Series(y.values - yhat, index=y.index, name="residual")
 
     vif = compute_vif(X_df) if compute_vif_flag else None
 
     return {
         "coef": coef, "stderr": stderr, "tvalues": tvalues, "pvalues": pvalues,
         "yhat": yhat_s, "residuals": resid_s,
-        "metrics": info["metrics"], "vif": vif,
+        "metrics": metrics, "vif": vif,
     }
 
 
 # ----------------------------
-# Optional Ridge/Lasso (sklearn)
+# Optional Ridge/Lasso (sklearn) with optional non-negativity
 # ----------------------------
 def _wrap_sklearn_linear(model, X_df: pd.DataFrame, y: pd.Series,
-                         add_constant: bool, compute_vif_flag: bool) -> Dict[str, Any]:
-    import numpy as np
-    import pandas as pd
-
+                         add_constant: bool, compute_vif_flag: bool,
+                         force_nonnegative: bool) -> Dict[str, Any]:
     X = X_df.copy()
     names = list(X.columns)
     if add_constant:
@@ -176,73 +220,88 @@ def _wrap_sklearn_linear(model, X_df: pd.DataFrame, y: pd.Series,
 
     model.fit(X.values, y.values)
     yhat = model.predict(X.values)
-    resid = y.values - yhat
-    n, p = X.shape
-
-    sse = float(np.sum(resid ** 2))
-    ybar = float(np.mean(y.values))
-    sst = float(np.sum((y.values - ybar) ** 2))
-    r2 = np.nan if sst == 0 else 1.0 - sse / sst
-    adj_r2 = np.nan if n <= p else 1.0 - (1.0 - r2) * (n - 1) / (n - p)
-    rmse = float(np.sqrt(sse / n)) if n > 0 else np.nan
-    mae = float(np.mean(np.abs(resid))) if n > 0 else np.nan
-    mape = float(np.mean(np.abs(resid) / np.maximum(np.abs(y.values), 1e-12))) if n > 0 else np.nan
-    aic = float(n * np.log(sse / n + 1e-12) + 2 * p) if n > 0 else np.nan
-    bic = float(n * np.log(sse / n + 1e-12) + p * np.log(n + 1e-12)) if n > 0 else np.nan
-
-    # coefficients
-    if add_constant:
-        if hasattr(model, "coef_"):
-            # const is first column we added
-            if model.coef_.ndim == 1:
-                coef = np.r_[model.coef_[0] if len(model.coef_)>0 else 0.0, model.coef_]
+    beta = None
+    try:
+        # Build combined coef vector including intercept if not add_constant
+        if add_constant:
+            # First column is our const; sklearn handled intercept internally if fit_intercept=False
+            if hasattr(model, "coef_"):
+                # We don't know which element corresponds to const in coef_ → treat intercept as 0
+                beta = np.r_[0.0, np.ravel(model.coef_)]
             else:
-                coef = np.r_[0.0, model.coef_.ravel()]
+                beta = np.zeros(X.shape[1])
         else:
-            coef = np.zeros(p)
-    else:
-        # add explicit const from intercept_
-        if hasattr(model, "intercept_"):
-            coef = np.r_[model.intercept_, model.coef_.ravel()]
+            # add explicit const
+            intercept = float(getattr(model, "intercept_", 0.0))
+            coef_only = np.ravel(getattr(model, "coef_", np.zeros(X.shape[1])))
+            beta = np.r_[intercept, coef_only]
+            # and reflect const in names
             names = ["const"] + names
-        else:
-            coef = np.r_[0.0, model.coef_.ravel()]
-            names = ["const"] + names
+            # rebuild predictions accordingly
+            yhat = (np.c_[np.ones((X.shape[0], 1)), X.values] @ beta)
+    except Exception:
+        beta = np.zeros(X.shape[1])
 
-    coef_s = pd.Series(coef, index=names, name="coef")
-    stderr = pd.Series([np.nan]*len(names), index=names, name="std_err")
-    tvals  = pd.Series([np.nan]*len(names), index=names, name="t")
-    pvals  = pd.Series([np.nan]*len(names), index=names, name="p_value")
+    # Optional positivity
+    if force_nonnegative:
+        beta = np.maximum(0.0, beta)
+        # Recompute predictions/metrics from clamped beta
+        X_design = np.c_[np.ones((X.shape[0], 1)), X.values] if not add_constant else X.values
+        if add_constant:
+            # our X already contains const as first column
+            yhat = X_design @ beta
+            p = X.shape[1]
+        else:
+            yhat = X_design @ beta
+            p = X_design.shape[1]
+        metrics = _metrics_from_yhat(y.values.astype(float), yhat, p)
+        stderr = pd.Series([np.nan]*len(names), index=names, name="std_err")
+        tvals  = pd.Series([np.nan]*len(names), index=names, name="t")
+        pvals  = pd.Series([np.nan]*len(names), index=names, name="p_value")
+    else:
+        # Use original predictions
+        p = (X.shape[1] if add_constant else X.shape[1] + 1)
+        metrics = _metrics_from_yhat(y.values.astype(float), yhat, p)
+        stderr = pd.Series([np.nan]*len(names), index=names, name="std_err")  # sklearn doesn't give SEs
+        tvals  = pd.Series([np.nan]*len(names), index=names, name="t")
+        pvals  = pd.Series([np.nan]*len(names), index=names, name="p_value")
 
     yhat_s = pd.Series(yhat, index=y.index, name="yhat")
-    resid_s = pd.Series(resid, index=y.index, name="residual")
+    resid_s = pd.Series(y.values - yhat, index=y.index, name="residual")
+    coef_s = pd.Series(beta, index=names, name="coef")
     vif = compute_vif(X_df) if compute_vif_flag else None
 
     return {
         "coef": coef_s, "stderr": stderr, "tvalues": tvals, "pvalues": pvals,
         "yhat": yhat_s, "residuals": resid_s,
-        "metrics": {"n": n, "p": p, "df_resid": max(n-p,1), "sse": sse, "sst": sst,
-                    "r2": r2, "adj_r2": adj_r2, "rmse": rmse, "mae": mae, "mape": mape, "aic": aic, "bic": bic},
-        "vif": vif,
+        "metrics": metrics, "vif": vif,
     }
 
 
 def ridge_model(X_df: pd.DataFrame, y: pd.Series, alpha: float = 1.0,
-                add_constant: bool = True, compute_vif_flag: bool = True) -> Dict[str, Any]:
+                add_constant: bool = True, compute_vif_flag: bool = True,
+                force_nonnegative: bool = False) -> Dict[str, Any]:
     if not _HAVE_SKLEARN:
         raise RuntimeError("scikit-learn not installed")
     from sklearn.linear_model import Ridge
-    mdl = Ridge(alpha=alpha, fit_intercept=not add_constant)
-    return _wrap_sklearn_linear(mdl, X_df, y, add_constant, compute_vif_flag)
+    try:
+        mdl = Ridge(alpha=alpha, fit_intercept=not add_constant)
+    except Exception:
+        mdl = Ridge(alpha=alpha)
+    return _wrap_sklearn_linear(mdl, X_df, y, add_constant, compute_vif_flag, force_nonnegative)
 
 
 def lasso_model(X_df: pd.DataFrame, y: pd.Series, alpha: float = 1.0,
-                add_constant: bool = True, compute_vif_flag: bool = True) -> Dict[str, Any]:
+                add_constant: bool = True, compute_vif_flag: bool = True,
+                force_nonnegative: bool = False) -> Dict[str, Any]:
     if not _HAVE_SKLEARN:
         raise RuntimeError("scikit-learn not installed")
     from sklearn.linear_model import Lasso
-    mdl = Lasso(alpha=alpha, fit_intercept=not add_constant, max_iter=10000)
-    return _wrap_sklearn_linear(mdl, X_df, y, add_constant, compute_vif_flag)
+    try:
+        mdl = Lasso(alpha=alpha, fit_intercept=not add_constant, max_iter=10000, positive=False)
+    except Exception:
+        mdl = Lasso(alpha=alpha, max_iter=10000)
+    return _wrap_sklearn_linear(mdl, X_df, y, add_constant, compute_vif_flag, force_nonnegative)
 
 
 # ----------------------------
@@ -315,7 +374,7 @@ def impact_decomposition(y: pd.Series,
     inc_total = float(contrib_s.sum())
     denom = max(base_total + inc_total, 1e-9)  # ensures Base% + Incremental% = 100
 
-    # Impactable % by channel (normalized across channels)
+    # Impactable % by channel (normalized across channels to 100%)
     impactable = contrib_s.copy()
     if inc_total > 0:
         impactable = (impactable / inc_total) * 100.0
