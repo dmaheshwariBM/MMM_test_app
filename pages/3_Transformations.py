@@ -224,11 +224,11 @@ with c1:
                 tmp.at[i, "k"] = round(ksug, 6)
                 tmp.at[i, "suggested_k"] = round(ksug, 6)
         st.session_state[cfg_key] = tmp
-        st.experimental_rerun()
+        st.rerun()
 with c2:
     if st.button("Reset all", help="Reset to fresh suggestions.", use_container_width=True):
         del st.session_state[cfg_key]
-        st.experimental_rerun()
+        st.rerun()
 with c3:
     st.caption("Tip: For **MinMax**, default [0,1] is common; for modeling, Standardize/Robust can help.")
 
