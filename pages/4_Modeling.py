@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from core import modeling
 
-st.title("📈 Modeling — Batch Runner (NNLS option)")
+st.title("📈 Modeling — Batch Runner")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
