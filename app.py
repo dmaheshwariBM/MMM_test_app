@@ -4,7 +4,7 @@ import time
 import json
 from datetime import datetime
 
-st.set_page_config(page_title="MMM Tool", layout="wide", page_icon="📊")
+st.set_page_config(page_title="Marketing Mix Modeling Tool", layout="wide", page_icon="📊")
 
 # --- Header (logo + title)
 col1, col2 = st.columns([1, 6])
