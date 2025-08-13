@@ -1,4 +1,4 @@
-# pages/2_Transformations.py
+# pages/3_Transformations.py
 import os, json
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -55,8 +55,7 @@ if not files:
     st.info("No CSVs in `data/` yet. Upload files in **Data Upload**.")
     st.stop()
 
-ds_index = 0
-dataset = st.selectbox("Dataset", files, index=ds_index, key="tfm_dataset_select")
+dataset = st.selectbox("Dataset", files, index=0, key="tfm_dataset_select")
 df_raw = _read_csv(os.path.join(DATA_DIR, dataset))
 
 st.caption(f"Rows: {len(df_raw):,} • Columns: {len(df_raw.columns)}")
@@ -66,7 +65,6 @@ st.caption(f"Rows: {len(df_raw):,} • Columns: {len(df_raw.columns)}")
 # ---------------------------------
 all_cols = list(df_raw.columns)
 num_cols = [c for c in all_cols if pd.api.types.is_numeric_dtype(df_raw[c])]
-non_num_cols = [c for c in all_cols if c not in num_cols]
 
 with st.expander("📎 Key columns", expanded=True):
     c1, c2, c3, c4 = st.columns(4)
@@ -107,73 +105,89 @@ with st.expander("📎 Key columns", expanded=True):
 # Candidate metrics (exclude key columns)
 # ---------------------------------
 exclude = set([c for c in (time_col, id_col, target_col, segment_col) if c and c != "— (none)"])
-metric_cols = [c for c in df_raw.columns if pd.api.types.is_numeric_dtype(df_raw[c]) and c not in exclude and not c.startswith("_tfm_")]
+metric_cols = [c for c in df_raw.columns
+               if pd.api.types.is_numeric_dtype(df_raw[c])
+               and c not in exclude and not c.startswith("_tfm_")]
 
 st.write(f"**Transformable metrics (numeric):** {len(metric_cols)}")
 
 # ---------------------------------
-# Build or load config table in session
+# Build or upgrade config table in session
 # ---------------------------------
 cfg_key = _cfg_key(dataset)
+required_cols = [
+    "use","metric","transform","k","suggested_k",
+    "lag_months","adstock_alpha","order",
+    "scaling","scale_min","scale_max"
+]
+
+def _empty_defaults_for_metric(m: str, df: pd.DataFrame) -> Dict[str, Any]:
+    s = pd.to_numeric(df[m], errors="coerce").dropna()
+    skew = float(s.skew()) if len(s) > 2 else 0.0
+    tfm_default = "Log" if skew > 1.0 else "NegExp"
+    k_sug = _suggest_k_for_series(s, tfm_default)
+    return {
+        "use": True,
+        "metric": m,
+        "transform": tfm_default,
+        "k": round(k_sug, 6),
+        "suggested_k": round(k_sug, 6),
+        "lag_months": 0,
+        "adstock_alpha": 0.0,
+        "order": _default_order(),
+        "scaling": "None",
+        "scale_min": 0.0,
+        "scale_max": 1.0,
+    }
+
 if cfg_key not in st.session_state:
-    rows = []
-    for m in metric_cols:
-        s = pd.to_numeric(df_raw[m], errors="coerce").dropna()
-        skew = float(s.skew()) if len(s) > 2 else 0.0
-        tfm_default = "Log" if skew > 1.0 else "NegExp"
-        k_sug = _suggest_k_for_series(s, tfm_default)
-        rows.append({
-            "use": True,
-            "metric": m,
-            "transform": tfm_default,
-            "k": round(k_sug, 6),
-            "suggested_k": round(k_sug, 6),
-            "lag_months": 0,
-            "adstock_alpha": 0.0,
-            "order": _default_order(),
-            # new scaling fields
-            "scaling": "None",
-            "scale_min": 0.0,
-            "scale_max": 1.0,
-        })
-    st.session_state[cfg_key] = pd.DataFrame(rows)
+    st.session_state[cfg_key] = pd.DataFrame([_empty_defaults_for_metric(m, df_raw) for m in metric_cols])
 else:
     cfg_df = st.session_state[cfg_key].copy()
+
+    # Ensure required columns exist (upgrade older session configs)
+    for col in required_cols:
+        if col not in cfg_df.columns:
+            if col == "scaling":
+                cfg_df[col] = "None"
+            elif col == "scale_min":
+                cfg_df[col] = 0.0
+            elif col == "scale_max":
+                cfg_df[col] = 1.0
+            elif col == "suggested_k":
+                cfg_df[col] = np.nan
+            elif col == "use":
+                cfg_df[col] = True
+            elif col == "order":
+                cfg_df[col] = _default_order()
+            else:
+                # safe default
+                cfg_df[col] = 0.0
+
+    # Add any new metrics that appeared
     known = set(cfg_df["metric"])
     new_rows = []
     for m in metric_cols:
         if m not in known:
-            s = pd.to_numeric(df_raw[m], errors="coerce").dropna()
-            tfm_default = "NegExp"
-            k_sug = _suggest_k_for_series(s, tfm_default)
-            new_rows.append({
-                "use": True,
-                "metric": m,
-                "transform": tfm_default,
-                "k": round(k_sug, 6),
-                "suggested_k": round(k_sug, 6),
-                "lag_months": 0,
-                "adstock_alpha": 0.0,
-                "order": _default_order(),
-                "scaling": "None",
-                "scale_min": 0.0,
-                "scale_max": 1.0,
-            })
+            new_rows.append(_empty_defaults_for_metric(m, df_raw))
     if new_rows:
-        st.session_state[cfg_key] = pd.concat([cfg_df, pd.DataFrame(new_rows)], ignore_index=True)
+        cfg_df = pd.concat([cfg_df, pd.DataFrame(new_rows)], ignore_index=True)
 
-# keep only metrics present
+    # Keep only metrics still present
+    cfg_df = cfg_df[cfg_df["metric"].isin(metric_cols)].reset_index(drop=True)
+    st.session_state[cfg_key] = cfg_df
+
 cfg_df = st.session_state[cfg_key]
-cfg_df = cfg_df[cfg_df["metric"].isin(metric_cols)].reset_index(drop=True)
-st.session_state[cfg_key] = cfg_df
 
 # ---------------------------------
 # Editor
 # ---------------------------------
 st.markdown("#### Configure transformations & scaling")
 st.caption(
-    "Curvature **k** applies to Log/NegExp (Log: log(1+k·x), NegExp: 1−exp(−k·x)). "
-    "Scaling is applied at the end. For **MinMax**, set `scale_min` & `scale_max`."
+    "Set **Transform** to **None** for no transformation. "
+    "Set **Scaling** to **None** for no scaling. "
+    "For **MinMax**, `scale_min/scale_max` are used. "
+    "Curvature **k** applies to Log/NegExp."
 )
 
 edited_cfg = st.data_editor(
@@ -184,16 +198,18 @@ edited_cfg = st.data_editor(
     column_config={
         "use": st.column_config.CheckboxColumn("Use"),
         "metric": st.column_config.TextColumn("Metric", disabled=True),
-        "transform": st.column_config.SelectboxColumn("Transform", options=["None","Log","NegExp"],
-                                                      help="Select a transform type."),
-        "k": st.column_config.NumberColumn("k (curvature)", help="Shape parameter. Suggested based on mean."),
+        "transform": st.column_config.SelectboxColumn(
+            "Transform", options=["None","Log","NegExp"]
+        ),
+        "k": st.column_config.NumberColumn("k (curvature)", help="Shape parameter for Log/NegExp."),
         "suggested_k": st.column_config.NumberColumn("k (suggested)", disabled=True),
-        "lag_months": st.column_config.NumberColumn("Lag (months)", min_value=0, step=1, help="K in finite adstock."),
+        "lag_months": st.column_config.NumberColumn("Lag (months)", min_value=0, step=1,
+                                                    help="K in finite adstock."),
         "adstock_alpha": st.column_config.NumberColumn("Adstock α (0–1)", min_value=0.0, max_value=1.0, step=0.05,
-                                                       help="Decay; effective_t = x_t + αx_{t-1} + ... + α^K x_{t-K}"),
-        "order": st.column_config.SelectboxColumn("Order", options=["Transform→Adstock+Lag","Adstock+Lag→Transform"],
-                                                  help="Choose whether to transform before or after adstock/lag."),
-        # NEW: scaling
+                                                       help="Decay; Effective_t = x_t + αx_{t-1} + … + α^K x_{t-K}"),
+        "order": st.column_config.SelectboxColumn(
+            "Order", options=["Transform→Adstock+Lag","Adstock+Lag→Transform"]
+        ),
         "scaling": st.column_config.SelectboxColumn(
             "Scaling",
             options=[
@@ -205,10 +221,9 @@ edited_cfg = st.data_editor(
                 "Max norm (÷ max)",
                 "Unit length (L2)",
             ],
-            help="Applied after transform/adstock+lag."
         ),
-        "scale_min": st.column_config.NumberColumn("scale_min (for MinMax)", help="Lower bound for MinMax scaling."),
-        "scale_max": st.column_config.NumberColumn("scale_max (for MinMax)", help="Upper bound for MinMax scaling."),
+        "scale_min": st.column_config.NumberColumn("scale_min (MinMax)"),
+        "scale_max": st.column_config.NumberColumn("scale_max (MinMax)"),
     }
 )
 
@@ -227,10 +242,10 @@ with c1:
         st.rerun()
 with c2:
     if st.button("Reset all", help="Reset to fresh suggestions.", use_container_width=True):
-        del st.session_state[cfg_key]
+        st.session_state.pop(cfg_key, None)
         st.rerun()
 with c3:
-    st.caption("Tip: For **MinMax**, default [0,1] is common; for modeling, Standardize/Robust can help.")
+    st.caption("Tip: Choose **None** for Transform/Scaling to pass the metric unchanged (except adstock/lag if set).")
 
 # Persist edits
 st.session_state[cfg_key] = edited_cfg
@@ -263,7 +278,7 @@ else:
     stats = pd.DataFrame({
         "Series": ["Original", "Transformed+Scaled"],
         "Mean": [raw.mean(), eff.mean()],
-        "Std": [raw.std(), eff.std()],
+        "Std": [raw.std(ddof=0), eff.std(ddof=0)],
         "Min": [raw.min(), eff.min()],
         "Max": [raw.max(), eff.max()],
         "Non-Null": [raw.notna().sum(), eff.notna().sum()]
