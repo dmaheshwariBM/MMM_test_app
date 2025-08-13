@@ -1,38 +1,52 @@
 import streamlit as st
 import pandas as pd
 import os
+from typing import Optional
 from core import io
 
 st.title("📁 Data Upload")
+st.caption("Upload multiple CSV/XLSX files. No previews are shown unless you select a file below.")
+
 os.makedirs("data", exist_ok=True)
 
-uploaded_files = st.file_uploader("Upload CSV or Excel files", type=["csv","xlsx"], accept_multiple_files=True)
+# --- Upload UI at top
+uploaded_files = st.file_uploader(
+    "Upload CSV or Excel files", type=["csv", "xlsx"], accept_multiple_files=True
+)
 if uploaded_files:
     for uf in uploaded_files:
-        path = os.path.join("data", uf.name)
-        with open(path, "wb") as f:
+        save_path = os.path.join("data", uf.name)
+        with open(save_path, "wb") as f:
             f.write(uf.getbuffer())
-    st.success(f"Uploaded {len(uploaded_files)} files to data/")
+    st.success(f"Uploaded {len(uploaded_files)} file(s) to `data/`")
 
-st.subheader("Data Quality Reports")
-files = [f for f in os.listdir("data") if f.endswith(('.csv','.xlsx'))]
-for f in files:
-    st.markdown(f"**{f}**")
-    df = io.load_csv_or_excel(os.path.join("data", f))
-    rep = io.data_quality_report(df)
-    if rep.empty:
-        st.success("No issues detected")
-    else:
-        st.dataframe(rep, use_container_width=True)
-    st.dataframe(df.head(), use_container_width=True)
+# --- List files (no previews)
+def _human_size(bytes_: int) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if bytes_ < 1024.0:
+            return f"{bytes_:,.0f} {unit}"
+        bytes_ /= 1024.0
+    return f"{bytes_:,.0f} TB"
 
-# Optional quick merge for sample data
-st.divider()
-st.caption("Quick merge (optional): If you have spend (Channel,Spend) and sales (Sales) by a common date column (e.g., Week), you can generate a merged master CSV.")
-if st.button("Build sample master from sample_spend.csv + sample_sales.csv"):
-    spend = io.load_csv_or_excel("data/sample_spend.csv")
-    sales = io.load_csv_or_excel("data/sample_sales.csv")
-    master = io.merge_spend_sales(spend, sales, date_key="Week")
-    master.to_csv("data/master.csv", index=False)
-    st.success("Created data/master.csv")
-    st.dataframe(master.head(), use_container_width=True)
+files = [f for f in os.listdir("data") if f.lower().endswith((".csv",".xlsx"))]
+if not files:
+    st.info("No files in `data/` yet.")
+else:
+    rows = []
+    for f in sorted(files):
+        p = os.path.join("data", f)
+        try:
+            stat = os.stat(p)
+            rows.append({
+                "File": f,
+                "Type": "CSV" if f.lower().endswith(".csv") else "Excel",
+                "Size": _human_size(stat.st_size)
+            })
+        except Exception:
+            continue
+    st.subheader("Files")
+    st.dataframe(rows, use_container_width=True)
+
+# --- Show details only after user selects a file
+st.subheader("Inspect a File (optional)")
+sel = st.selectbox("Select a file to inspect", [No]()
