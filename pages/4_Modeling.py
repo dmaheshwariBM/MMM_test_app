@@ -1,144 +1,321 @@
-# core/modeling.py
-# v1.6.0  ASCII-only, dependency-light OLS with optional nonnegative betas
-# Exposes:
-#   - build_design(df, features) -> X_df
-#   - ols_model(X_df, y, force_nonnegative=True) -> (coef_dict, metrics, yhat_list)
-#   - compute_decomposition(df, coef, features, target=None, yhat=None) -> decomp dict
+# pages/4_Modeling.py
+# v2.4.0  ASCII-only. Queue multiple models, run, preview, and robustly save JSON.
 
-from typing import Dict, Any, List, Tuple, Optional
+import os
+import re
+import glob
+import json
+from datetime import datetime
+from typing import Dict, Any, List
+
 import numpy as np
 import pandas as pd
+import streamlit as st
 
-def build_design(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
-    X = pd.DataFrame(index=df.index)
-    for c in features:
-        if c in df.columns:
-            X[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+from core import modeling
+
+PAGE_ID = "MODELING_PAGE_v2_4_0"
+st.title("Modeling")
+st.caption("Page ID: {}".format(PAGE_ID))
+
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ---------- Writable results root ----------
+def _abs(p: str) -> str:
+    return os.path.abspath(p)
+
+CANDIDATE_RESULTS_ROOTS: List[str] = []
+_env = os.environ.get("MMM_RESULTS_DIR")
+if _env:
+    CANDIDATE_RESULTS_ROOTS.append(_abs(_env))
+CANDIDATE_RESULTS_ROOTS.append(_abs(os.path.expanduser("~/.mmm_results")))
+CANDIDATE_RESULTS_ROOTS.append(_abs("/tmp/mmm_results"))
+CANDIDATE_RESULTS_ROOTS.append(_abs("results"))
+
+def _ensure_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        testf = os.path.join(path, ".write_test")
+        with open(testf, "w", encoding="utf-8") as f:
+            f.write("ok")
+        os.remove(testf)
+        return True
+    except Exception:
+        return False
+
+def _pick_results_root() -> str:
+    for root in CANDIDATE_RESULTS_ROOTS:
+        if _ensure_dir(root):
+            return root
+    fb = _abs(os.path.expanduser("~/mmm_results_fallback"))
+    _ensure_dir(fb)
+    return fb
+
+RESULTS_ROOT = _pick_results_root()
+st.caption("Saving models under: {}".format(RESULTS_ROOT))
+
+# Persisted banners for last save status
+if "last_saved_path" in st.session_state and st.session_state["last_saved_path"]:
+    st.success("Saved: {}".format(st.session_state["last_saved_path"]))
+if "last_save_error" in st.session_state and st.session_state["last_save_error"]:
+    st.error(st.session_state["last_save_error"])
+
+def _safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:72]
+
+def _json_ready(obj: Any):
+    import numpy as _np
+    from datetime import datetime as _dt
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, _dt):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(x) for x in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in ("_ts", "_path"):
+                continue
+            out[str(k)] = _json_ready(v)
+        return out
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except Exception:
+            pass
+    try:
+        if isinstance(obj, (_np.floating, _np.integer)):
+            return obj.item()
+    except Exception:
+        pass
+    try:
+        return float(obj)
+    except Exception:
+        return str(obj)
+
+def _save_result_json(results_root: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
+    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(results_root, batch_ts)
+    os.makedirs(out_dir, exist_ok=True)
+    fname = "{}__{}__{}.json".format(batch_ts, _safe(name), _safe(target))
+    body = {"batch_ts": batch_ts, "name": name, "target": target, "dataset": dataset}
+    body.update(payload)
+    body = _json_ready(body)
+    full_path = os.path.join(out_dir, fname)
+    with open(full_path, "w", encoding="utf-8") as f:
+        json.dump(body, f, indent=2)
+    return full_path
+
+# ---------- Data selection ----------
+files = [f for f in os.listdir(DATA_DIR) if f.lower().endswith(".csv")]
+if not files:
+    st.info("No CSV files in data/. Please upload data first.")
+    st.stop()
+
+dataset = st.selectbox("Dataset (CSV in data/)", options=sorted(files), index=0)
+df = pd.read_csv(os.path.join(DATA_DIR, dataset))
+
+numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+if not numeric_cols:
+    st.error("No numeric columns found in this dataset.")
+    st.stop()
+
+target = st.selectbox("Target column", options=numeric_cols, index=0)
+feature_choices = [c for c in numeric_cols if c != target]
+
+st.markdown("Add model specs to a queue, run them, preview, and save.")
+m_name = st.text_input("Model name", value="base_model_1")
+X_cols = st.multiselect("Independent variables", options=feature_choices)
+
+force_nonneg = st.checkbox("Force negative estimates to 0", value=True)
+
+# Train window by integer index
+max_idx = max(1, len(df) - 1)
+w0, w1 = st.slider(
+    "Train window (row indices inclusive)",
+    min_value=0, max_value=max_idx, value=(0, max_idx), step=1
+)
+
+# Queue state
+if "model_specs" not in st.session_state:
+    st.session_state["model_specs"] = []
+if "model_results" not in st.session_state:
+    st.session_state["model_results"] = []
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    if st.button("Add to queue"):
+        if not m_name.strip():
+            st.warning("Please provide a model name.")
+        elif not X_cols:
+            st.warning("Select at least one independent variable.")
         else:
-            X[c] = 0.0
-    return X
+            spec = {
+                "name": m_name.strip(),
+                "dataset": dataset,
+                "target": target,
+                "features": list(X_cols),
+                "force_nonnegative": bool(force_nonneg),
+                "train_window": [int(w0), int(w1)],
+            }
+            # de-dup by name within the queue
+            names = {s["name"] for s in st.session_state["model_specs"]}
+            if spec["name"] in names:
+                st.warning("A spec with this model name already exists in the queue.")
+            else:
+                st.session_state["model_specs"].append(spec)
+with c2:
+    if st.button("Clear queue"):
+        st.session_state["model_specs"] = []
+        st.session_state["model_results"] = []
+with c3:
+    rm_idx = st.number_input("Remove index", min_value=1, max_value=max(1, len(st.session_state["model_specs"])), value=1, step=1)
+with c4:
+    if st.button("Remove item"):
+        i = int(rm_idx) - 1
+        if 0 <= i < len(st.session_state["model_specs"]):
+            st.session_state["model_specs"].pop(i)
+            if i < len(st.session_state["model_results"]):
+                st.session_state["model_results"].pop(i)
 
-def _ols_closed_form(X: np.ndarray, y: np.ndarray) -> np.ndarray:
-    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
-    return beta
+if st.session_state["model_specs"]:
+    st.subheader("Queued model specs")
+    st.dataframe(pd.DataFrame(st.session_state["model_specs"]), use_container_width=True)
 
-def _metrics(y: np.ndarray, yhat: np.ndarray, p: int) -> Dict[str, float]:
-    n = len(y)
-    sse = float(np.sum((y - yhat) ** 2))
-    ybar = float(np.mean(y)) if n > 0 else 0.0
-    tss = float(np.sum((y - ybar) ** 2))
-    r2 = float(1.0 - sse / tss) if tss > 0 else float("nan")
-    adj = float(1.0 - (1.0 - r2) * (n - 1) / (n - p)) if (n > p and not np.isnan(r2)) else float("nan")
-    rmse = float(np.sqrt(sse / n)) if n > 0 else float("nan")
-    return {"r2": r2, "adj_r2": adj, "rmse": rmse, "n": n, "p": p}
+# ---------- Run models ----------
+def _run_one(spec: Dict[str, Any]) -> Dict[str, Any]:
+    ds = spec["dataset"]
+    tgt = spec["target"]
+    feats = spec["features"]
+    fneg = spec["force_nonnegative"]
+    a, b = spec["train_window"]
 
-def ols_model(
-    X_df: pd.DataFrame,
-    y: pd.Series,
-    force_nonnegative: bool = True
-) -> Tuple[Dict[str, float], Dict[str, float], List[float]]:
-    """
-    Returns (coef_dict, metrics, yhat_list)
-    - coef_dict includes "const" and one entry per X_df column.
-    - If force_nonnegative is True, negative betas (excluding intercept) are clipped to 0,
-      and the intercept is refit to minimize MSE given fixed nonnegative betas.
-    """
-    X = np.asarray(X_df.values, dtype=float)
-    yv = np.asarray(pd.to_numeric(y, errors="coerce").fillna(0.0), dtype=float)
+    df_local = pd.read_csv(os.path.join(DATA_DIR, ds)).iloc[a:b+1].copy()
+    X_df = modeling.build_design(df_local, feats)
+    y = pd.to_numeric(df_local[tgt], errors="coerce").fillna(0.0)
 
-    ones = np.ones((X.shape[0], 1), dtype=float)
-    Xw = np.hstack([ones, X])
+    coef, metrics, yhat = modeling.ols_model(X_df, y, force_nonnegative=fneg)
+    decomp = modeling.compute_decomposition(df_local, coef, feats, target=tgt, yhat=yhat)
 
-    beta = _ols_closed_form(Xw, yv)  # [b0, b1, b2, ...]
-    b0 = float(beta[0])
-    b = beta[1:].astype(float)
-
-    if force_nonnegative:
-        b = np.maximum(b, 0.0)
-        yhat_wo_b0 = X.dot(b)
-        b0 = float(np.mean(yv - yhat_wo_b0))
-        yhat = b0 + yhat_wo_b0
-    else:
-        yhat = Xw.dot(beta)
-
-    coef: Dict[str, float] = {"const": float(b0)}
-    for j, col in enumerate(X_df.columns):
-        coef[col] = float(b[j])
-
-    mets = _metrics(yv, np.asarray(yhat), p=1 + X.shape[1])
-    return coef, mets, list(map(float, yhat))
-
-def _intercept_key(coef: Dict[str, float]) -> Optional[str]:
-    for k in ("const", "Intercept", "intercept", "CONST", "const_", "_const", "beta0", "b0"):
-        if k in coef:
-            return k
-    return None
-
-def compute_decomposition(
-    df: pd.DataFrame,
-    coef: Dict[str, float],
-    features: List[str],
-    target: Optional[str] = None,
-    yhat: Optional[List[float]] = None
-) -> Dict[str, Any]:
-    """
-    Returns:
-      { "base_pct": float, "carryover_pct": 0.0,
-        "incremental_pct": float, "impactable_pct": {feature: pct, ...} }
-    - Base is the intercept share.
-    - Contributions from channels are positive-only when forming percentages.
-    - Denominator preference: sum(y) if target provided, else sum(yhat) if provided,
-      else sum of positive contributions, else 1.0.
-    """
-    n = len(df)
-    # channel contributions
-    contrib_sum: Dict[str, float] = {}
-    ik = _intercept_key(coef)
-    if ik is not None:
-        contrib_sum["const"] = float(coef.get(ik, 0.0)) * n
-
-    for f in features:
-        if f == "const":
-            continue
-        c = float(coef.get(f, 0.0))
-        x = pd.to_numeric(df[f], errors="coerce").fillna(0.0) if f in df.columns else pd.Series([0.0] * n)
-        s = float(np.sum(np.maximum(c * x.values, 0.0)))
-        contrib_sum[f] = s
-
-    total_from_y = None
-    if target and target in df.columns:
-        total_from_y = float(pd.to_numeric(df[target], errors="coerce").fillna(0.0).sum())
-    total_from_yhat = float(np.nansum(yhat)) if yhat is not None else 0.0
-    total_from_contrib = float(sum(contrib_sum.values())) if contrib_sum else 0.0
-    candidates = [t for t in (total_from_y, total_from_yhat, total_from_contrib) if t and t > 0]
-    denom = candidates[0] if candidates else 1.0
-
-    base_sum = float(contrib_sum.get("const", 0.0))
-    base_pct = 100.0 * base_sum / denom
-
-    impact_map: Dict[str, float] = {}
-    for f, s in contrib_sum.items():
-        if f == "const":
-            continue
-        disp = f[:-5] if f.endswith("__tfm") else f
-        if s > 0:
-            impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / denom
-
-    incr_pct = float(sum(impact_map.values()))
-    carry_pct = 0.0
-
-    # light normalization to 100 pct
-    total = base_pct + carry_pct + incr_pct
-    if incr_pct > 0 and abs(total - 100.0) > 0.05:
-        target_incr = max(0.0, 100.0 - base_pct - carry_pct)
-        scale = target_incr / incr_pct if incr_pct > 0 else 1.0
-        for k in list(impact_map.keys()):
-            impact_map[k] = impact_map[k] * scale
-        incr_pct = float(sum(impact_map.values()))
-
-    return {
-        "base_pct": float(round(base_pct, 6)),
-        "carryover_pct": float(round(carry_pct, 6)),
-        "incremental_pct": float(round(incr_pct, 6)),
-        "impactable_pct": {k: float(round(v, 6)) for k, v in impact_map.items()},
+    res = {
+        "name": spec["name"],
+        "type": "base",
+        "dataset": ds,
+        "target": tgt,
+        "features": feats,      # do not include "const" here
+        "coef": coef,           # contains "const"
+        "metrics": metrics,
+        "yhat": yhat,
+        "decomp": decomp,
     }
+    return res
+
+st.divider()
+if st.button("Run all models in queue"):
+    if not st.session_state["model_specs"]:
+        st.warning("Queue is empty.")
+    else:
+        results = []
+        for spec in st.session_state["model_specs"]:
+            try:
+                results.append(_run_one(spec))
+            except Exception as e:
+                results.append({"name": spec["name"], "error": str(e)})
+        st.session_state["model_results"] = results
+
+# ---------- Results preview ----------
+if st.session_state["model_results"]:
+    st.subheader("Results summary")
+    rows = []
+    for r in st.session_state["model_results"]:
+        if "error" in r:
+            rows.append({"name": r["name"], "status": "ERROR: {}".format(r["error"])})
+        else:
+            m = r.get("metrics", {})
+            rows.append({
+                "name": r.get("name"),
+                "target": r.get("target"),
+                "vars": ",".join(r.get("features", [])),
+                "r2": m.get("r2"),
+                "adj_r2": m.get("adj_r2"),
+                "rmse": m.get("rmse"),
+                "n": m.get("n"),
+            })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    idx = st.number_input("Inspect result index", min_value=1, max_value=len(st.session_state["model_results"]), value=1, step=1)
+    res = st.session_state["model_results"][int(idx)-1]
+
+    if "error" in res:
+        st.error("This spec failed: {}".format(res["error"]))
+    else:
+        st.markdown("Details for: {}".format(res["name"]))
+        # top coefficients view
+        co = res.get("coef", {})
+        co_items = [(k, float(v)) for k, v in co.items() if k != "const"]
+        co_df = pd.DataFrame(co_items, columns=["feature", "coef"]).sort_values("coef", ascending=False)
+        st.dataframe(co_df, use_container_width=True)
+
+        # decomposition bar chart
+        d = res.get("decomp", {})
+        impact = d.get("impactable_pct", {}) if isinstance(d, dict) else {}
+        if impact:
+            dfv = pd.DataFrame({"Channel": list(impact.keys()), "ImpactablePct": list(impact.values())}).set_index("Channel")
+            st.bar_chart(dfv)
+
+    st.divider()
+    cL, cM, cR = st.columns(3)
+    with cL:
+        if st.button("Save selected"):
+            try:
+                res = st.session_state["model_results"][int(idx)-1]
+                if "error" in res:
+                    st.error("Cannot save errored spec.")
+                else:
+                    path = _save_result_json(RESULTS_ROOT, res["name"], res["target"], res["dataset"], res)
+                    st.session_state["last_saved_path"] = path
+                    st.session_state["last_save_error"] = ""
+                    st.success("Saved: {}".format(path))
+            except Exception as e:
+                st.session_state["last_saved_path"] = ""
+                st.session_state["last_save_error"] = "Save failed: {}".format(e)
+                st.error(st.session_state["last_save_error"])
+    with cM:
+        if st.button("Save ALL"):
+            ok = 0
+            try:
+                for res in st.session_state["model_results"]:
+                    if "error" in res:
+                        continue
+                    path = _save_result_json(RESULTS_ROOT, res["name"], res["target"], res["dataset"], res)
+                    st.session_state["last_saved_path"] = path
+                    st.session_state["last_save_error"] = ""
+                    ok += 1
+                st.success("Saved {} model(s). Last: {}".format(ok, st.session_state.get("last_saved_path","")))
+            except Exception as e:
+                st.session_state["last_save_error"] = "Save failed: {}".format(e)
+                st.error(st.session_state["last_save_error"])
+    with cR:
+        if st.button("Send selected to Budget Optimization"):
+            try:
+                res = st.session_state["model_results"][int(idx)-1]
+                if "error" in res:
+                    st.error("Cannot send errored spec.")
+                else:
+                    skinny = [{
+                        "name": res.get("name"),
+                        "type": res.get("type"),
+                        "dataset": res.get("dataset"),
+                        "target": res.get("target"),
+                        "metrics": res.get("metrics", {}),
+                        "decomp": res.get("decomp", {}),
+                        "features": res.get("features", []),
+                        "_path": "(session)",
+                        "_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }]
+                    st.session_state["budget_candidates"] = skinny
+                    st.success("Sent to Budget Optimization.")
+            except Exception as e:
+                st.error("Send failed: {}".format(e))
