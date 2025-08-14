@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_4_0"
+PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_5_0"
 
 st.title("📊 Results — Compare, Inspect & Compose")
 st.caption(f"Page ID: `{PAGE_ID}` • Standalone (no core/results.py needed)")
@@ -18,9 +18,7 @@ RESULTS_DIR = "results"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Utilities (standalone)
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────────────────────── Utilities ─────────────────────────
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:72]
 
@@ -79,12 +77,6 @@ def normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
     return {"base_pct": base_pct, "carryover_pct": carry_pct, "incremental_pct": incr_pct, "impactable_pct": impact_map}
 
 def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Robust decomp for display:
-      Denominator: sum(target) → sum(yhat) → sum(contrib) → 1.0
-      Detect intercept (const/Intercept/...) even if features omitted it.
-      Normalize so Base+Carry+Incremental ≈ 100
-    """
     d = record.get("decomp")
     if isinstance(d, dict) and "impactable_pct" in d:
         return normalize_and_round(d)
@@ -105,7 +97,6 @@ def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
 
-    # Build contributions (include intercept even if not in features)
     contrib_sum: Dict[str, float] = {}
     n = len(df)
     ik = _intercept_key(coef)
@@ -113,13 +104,11 @@ def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
         contrib_sum["const"] = float(coef.get(ik, 0.0)) * n
 
     for f in features:
-        if f == "const":
-            continue
+        if f == "const": continue
         c = float(coef.get(f, 0.0))
         x = _to_num_series(df, f)
         contrib_sum[f] = float((c * x).clip(lower=0.0).sum())
 
-    # Denominator
     total_from_y = None
     tgt = record.get("target")
     if tgt and tgt in df.columns:
@@ -134,8 +123,7 @@ def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
 
     impact_map: Dict[str, float] = {}
     for f, s in contrib_sum.items():
-        if f == "const":
-            continue
+        if f == "const": continue
         disp = f[:-5] if f.endswith("__tfm") else f
         if s > 0:
             impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
@@ -171,9 +159,58 @@ def fmt_label(r: Dict[str, Any]) -> str:
 def _load_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(os.path.join(DATA_DIR, name))
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Import advanced models core (for the composer). Falls back to file path.
-# ───────────────────────────────────────────────────────────────────────────────
+# JSON-safe serializer (drops _ts/_path, converts numpy/datetime)
+def _json_ready(obj: Any):
+    import numpy as _np
+    from datetime import datetime as _dt
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, _dt):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(x) for x in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in ("_ts", "_path"):  # drop transient fields
+                continue
+            out[str(k)] = _json_ready(v)
+        return out
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except Exception:
+            pass
+    # numpy scalar?
+    try:
+        if isinstance(obj, (_np.floating, _np.integer)):
+            return obj.item()
+    except Exception:
+        pass
+    # fallback
+    try:
+        return float(obj)
+    except Exception:
+        return str(obj)
+
+def save_result_json(results_dir: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
+    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(results_dir, batch_ts)
+    os.makedirs(out_dir, exist_ok=True)
+    fname = f"{batch_ts}__{_safe(name)}__{_safe(target)}.json"
+    body = {
+        "batch_ts": batch_ts,
+        "name": name,
+        "target": target,
+        "dataset": dataset,
+        **payload
+    }
+    body = _json_ready(body)
+    with open(os.path.join(out_dir, fname), "w") as f:
+        json.dump(body, f, indent=2)
+    return out_dir
+
+# ───────────────────── Import advanced core (for composer) ─────────────────────
 def _import_advanced_models():
     try:
         from core import advanced_models as am  # type: ignore
@@ -195,9 +232,7 @@ if am is None:
 else:
     st.caption(f"Advanced core loaded from: `{getattr(am, '__file__', 'unknown')}` (v {getattr(am, 'ADV_MODELS_VERSION','?')})")
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Top actions: refresh, diagnostics
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────────────────── Top actions ─────────────────────
 cols_top = st.columns([1,1,4])
 with cols_top[0]:
     if st.button("🔄 Refresh list"):
@@ -205,9 +240,7 @@ with cols_top[0]:
 with cols_top[1]:
     show_diag = st.toggle("Diagnostics", value=False, help="Show raw files found under /results")
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Load catalog
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────────────────── Load catalog ─────────────────────
 catalog = load_results_catalog(RESULTS_DIR)
 if show_diag:
     st.info(f"Found {len(catalog)} saved JSONs under `{RESULTS_DIR}/**/*.json`")
@@ -218,12 +251,10 @@ if not catalog:
     st.info("No saved models yet. Build & save a model (Modeling or Advanced Models), then come back here.")
     st.stop()
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Tabs: Compare | Inspect | Compose adjustments
-# ───────────────────────────────────────────────────────────────────────────────
+# ───────────────────── Tabs ─────────────────────
 tab_cmp, tab_inspect, tab_compose = st.tabs(["📊 Compare", "🔎 Inspect one model", "🧩 Compose adjustments"])
 
-# ╭───────────────────────────── Compare ─────────────────────────────╮
+# ==== Compare ====
 with tab_cmp:
     st.markdown("#### All runs (latest first)")
     summary_rows = []
@@ -288,7 +319,7 @@ with tab_cmp:
         csv_bytes = csv_buf.getvalue().encode("utf-8")
         st.download_button("Download comparison CSV", data=csv_bytes, file_name="mmm_results_comparison.csv", mime="text/csv")
 
-        # NEW: Send to Budget Optimization
+        # Send to Budget Optimization
         st.subheader("Select for Budget Optimization")
         to_budget = st.multiselect("Models to send", options=chosen, default=chosen[:min(3, len(chosen))])
         if st.button("Send to Budget Optimization"):
@@ -310,7 +341,7 @@ with tab_cmp:
             st.session_state["budget_candidates"] = skinny
             st.success(f"Sent {len(skinny)} model(s) to Budget Optimization.")
 
-# ╭────────────────────────── Inspect one ────────────────────────────╮
+# ==== Inspect ====
 with tab_inspect:
     st.markdown("#### Pick a saved run")
     labels = [fmt_label(r) for r in catalog]
@@ -328,7 +359,7 @@ with tab_inspect:
         st.bar_chart(dfv)
         st.dataframe(dfv, use_container_width=True)
 
-# ╭─────────────────────── Compose adjustments ───────────────────────╮
+# ==== Compose adjustments ====
 with tab_compose:
     if am is None:
         st.warning("Install/restore `core/advanced_models.py` to use the composition workbench.")
@@ -360,7 +391,6 @@ with tab_compose:
     st.markdown("##### Add operations")
     cB, cR, cP = st.columns(3)
 
-    # Breakout builder
     with cB:
         st.write("**Breakout split**")
         parent = st.selectbox("Parent channel", options=features_disp, key="co_parent")
@@ -368,7 +398,6 @@ with tab_compose:
         if st.button("➕ Add Breakout"):
             st.session_state[ops_key].append({"type":"breakout_split","parent": parent,"subs": subs})
 
-    # Residual builder
     with cR:
         st.write("**Residual (on Base)**")
         extras = st.multiselect("Explain Base with", options=not_in_base, key="co_extras")
@@ -376,7 +405,6 @@ with tab_compose:
         if st.button("➕ Add Residual"):
             st.session_state[ops_key].append({"type":"residual_reattribute","extras": extras,"fraction": float(frac)})
 
-    # Pathway builder
     with cP:
         st.write("**Pathway**")
         A = st.selectbox("From (A)", options=features_disp, key="co_A")
@@ -385,8 +413,6 @@ with tab_compose:
             st.session_state[ops_key].append({"type":"pathway_redistribute","A": A,"B": B})
 
     st.divider()
-
-    # Pipeline table
     st.markdown("##### Pipeline")
     if not st.session_state[ops_key]:
         st.info("No operations yet. Add Breakout / Residual / Pathway above.")
@@ -414,10 +440,8 @@ with tab_compose:
                 st.rerun()
 
     st.divider()
-    # Preview apply pipeline
     if st.button("▶ Preview composed result", type="primary"):
         try:
-            # start with base record; carry forward decomp after each apply
             rec = dict(base)
             current_decomp = am._ensure_decomp_from_record_or_recompute(rec, df_base)
             rec["decomp"] = current_decomp
@@ -430,7 +454,7 @@ with tab_compose:
                 else:
                     out = am.pathway_redistribute(df=df_base, base_record=rec, channel_A=op["A"], channel_B=op["B"])
                 current_decomp = am.apply_decomp_update(rec, df_base, out)
-                rec["decomp"] = current_decomp  # so subsequent steps use the updated decomp
+                rec["decomp"] = current_decomp
 
             st.success("Composed result preview")
             d = current_decomp
@@ -449,28 +473,22 @@ with tab_compose:
             with cL:
                 nm = st.text_input("Save as name", value=f"{base.get('name','base')}__composite")
                 if st.button("💾 Save as new result"):
-                    # persist a new JSON next to others
-                    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    out_dir = os.path.join(RESULTS_DIR, batch_ts)
-                    os.makedirs(out_dir, exist_ok=True)
-                    fname = f"{batch_ts}__{_safe(nm)}__{_safe(base.get('target','?'))}.json"
-                    # store the pipeline for auditability
-                    payload = {**base}
-                    payload.update({
-                        "batch_ts": batch_ts,
-                        "name": nm,
-                        "target": base.get("target","?"),
-                        "dataset": base.get("dataset","?"),
+                    payload = {
                         "type": "composite",
                         "pipeline": st.session_state[ops_key],
-                        "decomp": current_decomp
-                    })
-                    with open(os.path.join(out_dir, fname), "w") as f:
-                        json.dump(payload, f, indent=2)
+                        "decomp": current_decomp,
+                        # carry over useful context for downstream pages
+                        "metrics": base.get("metrics", {}),
+                        "coef": base.get("coef", {}),
+                        "yhat": base.get("yhat", []),
+                        "features": base.get("features", []),
+                    }
+                    out_dir = save_result_json(
+                        RESULTS_DIR, nm, base.get("target","?"), base.get("dataset","?"), payload
+                    )
                     st.success(f"Saved to `{out_dir}`")
-                    st.rerun()  # <-- ensure the new composite appears in lists immediately
+                    st.rerun()  # ensure it appears immediately in lists
             with cM:
-                # Send preview directly to Budget Optimization without saving
                 if st.button("📤 Send PREVIEW to Budget Optimization"):
                     preview_skinny = [{
                         "name": f"{base.get('name','base')}__composite_preview",
@@ -487,7 +505,7 @@ with tab_compose:
                     st.success("Preview sent to Budget Optimization.")
             with cR:
                 if st.button("✏ Update base result"):
-                    # overwrite the selected base's decomp only
+                    # overwrite only the decomp in the base record file
                     for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
                         try:
                             with open(jf, "r") as f:
@@ -496,7 +514,7 @@ with tab_compose:
                                 keep = {k: rec0.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = current_decomp
                                 with open(jf, "w") as g:
-                                    json.dump(keep, g, indent=2)
+                                    json.dump(_json_ready(keep), g, indent=2)
                                 st.success("Base model updated.")
                                 st.rerun()
                                 break
