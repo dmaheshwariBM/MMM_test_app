@@ -1,12 +1,17 @@
 # pages/6_Results.py
-import os, json, glob, re
+import os, re, glob, json
+from io import StringIO
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import Dict, Any, List
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_2_0"
+
 st.title("📊 Results — Compare & Select for Optimization")
+st.caption(f"Page ID: `{PAGE_ID}` (standalone, no core/results.py required)")
 
 DATA_DIR = "data"
 RESULTS_DIR = "results"
@@ -14,14 +19,29 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ---------------------------
-# Utils
+# Utilities (standalone)
 # ---------------------------
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:72]
 
-def _load_all_results() -> List[Dict[str, Any]]:
+def _intercept_key(coef: Dict[str, float]) -> str | None:
+    for k in ("const", "Intercept", "intercept", "CONST", "const_", "_const", "beta0", "b0"):
+        if k in coef:
+            return k
+    return None
+
+def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
+    if name == "const":
+        return pd.Series(np.ones(len(df)), index=df.index, name="const")
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce").fillna(0.0)
+    if name.endswith("__tfm") and name[:-5] in df.columns:
+        return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
+    return pd.Series(np.zeros(len(df)), index=df.index, name=name)
+
+def load_results_catalog(results_dir: str = RESULTS_DIR) -> List[Dict[str, Any]]:
     rows = []
-    batches = sorted(glob.glob(os.path.join(RESULTS_DIR, "*")), reverse=True)
+    batches = sorted(glob.glob(os.path.join(results_dir, "*")), reverse=True)
     for b in batches:
         for jf in sorted(glob.glob(os.path.join(b, "*.json")), reverse=True):
             try:
@@ -40,29 +60,12 @@ def _load_all_results() -> List[Dict[str, Any]]:
     rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
     return rows
 
-def _metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
-    m = r.get("metrics", {}) or {}
-    return {"R²": m.get("r2"), "Adj R²": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
-
-def _intercept_key(coef: Dict[str, float]) -> str | None:
-    for k in ("const", "Intercept", "intercept", "CONST", "const_", "_const", "beta0", "b0"):
-        if k in coef: return k
-    return None
-
-def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
-    if name == "const":
-        return pd.Series(np.ones(len(df)), index=df.index, name="const")
-    if name in df.columns:
-        return pd.to_numeric(df[name], errors="coerce").fillna(0.0)
-    if name.endswith("__tfm") and name[:-5] in df.columns:
-        return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
-    return pd.Series(np.zeros(len(df)), index=df.index, name=name)
-
-def _normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
     base_pct = float(d.get("base_pct", 0.0))
     carry_pct = float(d.get("carryover_pct", 0.0))
     impact_map: Dict[str, float] = dict(d.get("impactable_pct", {}))
     incr_pct = float(sum(impact_map.values()))
+
     total = base_pct + carry_pct + incr_pct
     if incr_pct > 0 and abs(total - 100.0) > 0.05:
         target_incr = max(0.0, 100.0 - base_pct - carry_pct)
@@ -70,13 +73,14 @@ def _normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
         for k in list(impact_map.keys()):
             impact_map[k] *= scale
         incr_pct = float(sum(impact_map.values()))
+
     base_pct = float(round(base_pct, 6))
     carry_pct = float(round(carry_pct, 6))
     impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
     incr_pct = float(round(sum(impact_map.values()), 6))
     return {"base_pct": base_pct, "carryover_pct": carry_pct, "incremental_pct": incr_pct, "impactable_pct": impact_map}
 
-def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
+def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     """
     Robust decomp for display:
       Denominator: sum(target) → sum(yhat) → sum(contrib) → 1.0
@@ -85,7 +89,7 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     """
     d = record.get("decomp")
     if isinstance(d, dict) and "impactable_pct" in d:
-        return _normalize_and_round(d)
+        return normalize_and_round(d)
 
     dataset = record.get("dataset")
     features = record.get("features", []) or []
@@ -112,7 +116,6 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
 
     for f in features:
         if f == "const":
-            # already included via ik
             continue
         c = float(coef.get(f, 0.0))
         x = _to_num_series(df, f)
@@ -139,7 +142,11 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
         if s > 0:
             impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
 
-    return _normalize_and_round({"base_pct": base_pct, "carryover_pct": 0.0, "incremental_pct": float(sum(impact_map.values())), "impactable_pct": impact_map})
+    return normalize_and_round({"base_pct": base_pct, "carryover_pct": 0.0, "incremental_pct": float(sum(impact_map.values())), "impactable_pct": impact_map})
+
+def metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
+    m = r.get("metrics", {}) or {}
+    return {"R²": m.get("r2"), "Adj R²": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
 
 def _short_type(t: str) -> str:
     return {
@@ -149,7 +156,7 @@ def _short_type(t: str) -> str:
         "pathway_redistribute": "pathway",
     }.get(str(t), str(t) or "base")
 
-def _fmt_label(r: Dict[str, Any]) -> str:
+def fmt_label(r: Dict[str, Any]) -> str:
     nm = r.get("name","(unnamed)")
     tp = _short_type(r.get("type","base"))
     tgt = r.get("target","?")
@@ -160,7 +167,7 @@ def _fmt_label(r: Dict[str, Any]) -> str:
 # ---------------------------
 # Load catalog
 # ---------------------------
-catalog = _load_all_results()
+catalog = load_results_catalog(RESULTS_DIR)
 if not catalog:
     st.info("No saved models yet. Build a model in **Modeling**, then come back here.")
     st.stop()
@@ -170,7 +177,7 @@ summary_rows = []
 for r in catalog:
     summary_rows.append({
         "Name": r.get("name",""),
-        "Type": _short_type(r.get("type","base")),
+        "Type": (r.get("type") or "base"),
         "Target": r.get("target",""),
         "Saved at": r.get("_ts").strftime("%Y-%m-%d %H:%M:%S") if r.get("_ts") else "",
     })
@@ -179,7 +186,7 @@ st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=min(40
 # ---------------------------
 # Pick up to 5 models for comparison
 # ---------------------------
-labels = [_fmt_label(r) for r in catalog]
+labels = [fmt_label(r) for r in catalog]
 default_sel = labels[:2] if len(labels) >= 2 else labels[:1]
 chosen = st.multiselect("Select up to 5 models to compare", options=labels, default=default_sel, max_selections=5)
 if not chosen:
@@ -187,7 +194,6 @@ if not chosen:
 
 models = [catalog[labels.index(lbl)] for lbl in chosen]
 baseline = st.selectbox("Baseline for Δ", options=chosen, index=0)
-baseline_rec = models[chosen.index(baseline)]
 
 st.divider()
 
@@ -197,7 +203,7 @@ st.divider()
 st.subheader("Fit metrics")
 met = []
 for lbl, r in zip(chosen, models):
-    row = _metrics_row(r); row["Model"] = lbl
+    row = metrics_row(r); row["Model"] = lbl
     met.append(row)
 met_df = pd.DataFrame(met).set_index("Model")
 st.dataframe(met_df, use_container_width=True)
@@ -206,7 +212,7 @@ st.dataframe(met_df, use_container_width=True)
 # Decomposition summary
 # ---------------------------
 st.subheader("Decomposition summary")
-decomp_map = {lbl: _ensure_decomp(r) for lbl, r in zip(chosen, models)}
+decomp_map = {lbl: ensure_decomp(r) for lbl, r in zip(chosen, models)}
 decomp_rows = []
 for lbl in chosen:
     d = decomp_map[lbl]
@@ -241,7 +247,6 @@ else:
 # Export
 # ---------------------------
 st.subheader("Export")
-from io import StringIO
 csv_buf = StringIO()
 csv_buf.write("## metrics\n"); met_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
 csv_buf.write("## decomposition\n"); decomp_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
