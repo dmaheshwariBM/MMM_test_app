@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_3_0"
+PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_4_0"
 
 st.title("📊 Results — Compare, Inspect & Compose")
 st.caption(f"Page ID: `{PAGE_ID}` • Standalone (no core/results.py needed)")
@@ -172,7 +172,7 @@ def _load_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(os.path.join(DATA_DIR, name))
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Import advanced models core (for the builder). Falls back to file path.
+# Import advanced models core (for the composer). Falls back to file path.
 # ───────────────────────────────────────────────────────────────────────────────
 def _import_advanced_models():
     try:
@@ -287,6 +287,28 @@ with tab_cmp:
             csv_buf.write("## impactable_by_channel\n"); impact_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
         csv_bytes = csv_buf.getvalue().encode("utf-8")
         st.download_button("Download comparison CSV", data=csv_bytes, file_name="mmm_results_comparison.csv", mime="text/csv")
+
+        # NEW: Send to Budget Optimization
+        st.subheader("Select for Budget Optimization")
+        to_budget = st.multiselect("Models to send", options=chosen, default=chosen[:min(3, len(chosen))])
+        if st.button("Send to Budget Optimization"):
+            skinny = []
+            for lbl in to_budget:
+                r = models[chosen.index(lbl)]
+                d = decomp_map[lbl]
+                skinny.append({
+                    "name": r.get("name"),
+                    "type": r.get("type"),
+                    "dataset": r.get("dataset"),
+                    "target": r.get("target"),
+                    "metrics": r.get("metrics", {}),
+                    "decomp": d,
+                    "features": r.get("features", []),
+                    "_path": r.get("_path", ""),
+                    "_ts": r.get("_ts").strftime("%Y-%m-%d %H:%M:%S") if r.get("_ts") else "",
+                })
+            st.session_state["budget_candidates"] = skinny
+            st.success(f"Sent {len(skinny)} model(s) to Budget Optimization.")
 
 # ╭────────────────────────── Inspect one ────────────────────────────╮
 with tab_inspect:
@@ -422,8 +444,8 @@ with tab_compose:
                 st.bar_chart(dfv)
                 st.dataframe(dfv, use_container_width=True)
 
-            st.markdown("##### Save / Update")
-            cL, cR = st.columns(2)
+            st.markdown("##### Save / Update / Send to Budget")
+            cL, cM, cR = st.columns(3)
             with cL:
                 nm = st.text_input("Save as name", value=f"{base.get('name','base')}__composite")
                 if st.button("💾 Save as new result"):
@@ -446,6 +468,23 @@ with tab_compose:
                     with open(os.path.join(out_dir, fname), "w") as f:
                         json.dump(payload, f, indent=2)
                     st.success(f"Saved to `{out_dir}`")
+                    st.rerun()  # <-- ensure the new composite appears in lists immediately
+            with cM:
+                # Send preview directly to Budget Optimization without saving
+                if st.button("📤 Send PREVIEW to Budget Optimization"):
+                    preview_skinny = [{
+                        "name": f"{base.get('name','base')}__composite_preview",
+                        "type": "composite",
+                        "dataset": base.get("dataset"),
+                        "target": base.get("target"),
+                        "metrics": base.get("metrics", {}),
+                        "decomp": current_decomp,
+                        "features": base.get("features", []),
+                        "_path": "(preview)",
+                        "_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }]
+                    st.session_state["budget_candidates"] = preview_skinny
+                    st.success("Preview sent to Budget Optimization.")
             with cR:
                 if st.button("✏ Update base result"):
                     # overwrite the selected base's decomp only
@@ -459,6 +498,7 @@ with tab_compose:
                                 with open(jf, "w") as g:
                                     json.dump(keep, g, indent=2)
                                 st.success("Base model updated.")
+                                st.rerun()
                                 break
                         except Exception:
                             continue
