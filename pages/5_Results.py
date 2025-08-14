@@ -27,7 +27,6 @@ def _load_all_results() -> List[Dict[str, Any]]:
             try:
                 with open(jf, "r") as f:
                     r = json.load(f)
-                # enrich
                 r["_path"] = jf
                 r["_batch"] = os.path.basename(b)
                 ts = r.get("batch_ts") or os.path.basename(b)
@@ -41,44 +40,11 @@ def _load_all_results() -> List[Dict[str, Any]]:
     rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
     return rows
 
-def _short_type(t: str) -> str:
-    return {
-        "base": "base",
-        "breakout": "breakout",
-        "breakout_split": "breakout-split",
-        "interaction": "interactions",
-        "residual": "residual",
-        "residual_reattribute": "resid-reattrib",
-        "pathway_redistribute": "pathway",
-        "breakout_overwrite": "breakout*",
-        "interaction_overwrite": "interactions*",
-        "residual_overwrite": "residual*",
-    }.get(str(t), str(t) or "base")
-
-def _fmt_label(r: Dict[str, Any]) -> str:
-    nm = r.get("name","(unnamed)")
-    tp = _short_type(r.get("type","base"))
-    ds = r.get("dataset","?")
-    tgt = r.get("target","?")
-    ts = r.get("_ts")
-    when = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "—"
-    return f"{nm} • {tp} • {tgt} • {when}"
-
 def _metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
     m = r.get("metrics", {}) or {}
-    return {
-        "R²": m.get("r2", None),
-        "Adj R²": m.get("adj_r2", None),
-        "RMSE": m.get("rmse", None),
-        "n": m.get("n", None),
-        "p": m.get("p", None),
-    }
-
-def _to_pct(v):
-    return None if v is None or (isinstance(v, float) and not np.isfinite(v)) else float(v)
+    return {"R²": m.get("r2"), "Adj R²": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
 
 def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
-    """Return numeric series for a feature name; handles '__tfm' fallback to raw."""
     if name == "const":
         return pd.Series(np.ones(len(df)), index=df.index, name="const")
     if name in df.columns:
@@ -87,21 +53,15 @@ def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
         return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
     return pd.Series(np.zeros(len(df)), index=df.index, name=name)
 
-# pages/6_Results.py — replace just this function
-
 def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Robustly return a decomp dict.
-    If record['decomp'] is missing, recompute minimal decomp from coef/features and dataset CSV.
-    Uses a safe denominator:
-      1) sum(actual target) > 0
-      2) sum(yhat) > 0
-      3) sum(all contributions) > 0
-      4) 1.0 (never 1e-12)
+    Robust decomp for display:
+      Denominator: sum(target) → sum(yhat) → sum(contrib) → 1.0
+      Normalize so Base+Carry+Incremental ≈ 100
     """
     d = record.get("decomp")
     if isinstance(d, dict) and "impactable_pct" in d:
-        return d
+        return _normalize_and_round(d)
 
     dataset = record.get("dataset")
     features = record.get("features", []) or []
@@ -110,7 +70,6 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
 
     if not dataset:
         return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
-
     path = os.path.join(DATA_DIR, dataset)
     if not os.path.exists(path):
         return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
@@ -127,12 +86,7 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
         if f == "const":
             s = float((c * np.ones(len(df))).sum())
         else:
-            if f in df.columns:
-                x = pd.to_numeric(df[f], errors="coerce").fillna(0.0)
-            elif f.endswith("__tfm") and f[:-5] in df.columns:
-                x = pd.to_numeric(df[f[:-5]], errors="coerce").fillna(0.0)
-            else:
-                x = pd.Series(np.zeros(len(df)))
+            x = _to_num_series(df, f)
             s = float((c * x).clip(lower=0.0).sum())
         contrib_sum[f] = s
 
@@ -143,8 +97,7 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
         total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
     total_from_yhat = float(np.nansum(yhat)) if yhat.size > 0 else 0.0
     total_from_contrib = float(sum(contrib_sum.values())) if contrib_sum else 0.0
-
-    candidates = [t for t in [total_from_y, total_from_yhat, total_from_contrib] if t and t > 0]
+    candidates = [t for t in (total_from_y, total_from_yhat, total_from_contrib) if t and t > 0]
     total_pred = candidates[0] if candidates else 1.0
 
     base_sum = float(contrib_sum.get("const", 0.0))
@@ -158,26 +111,42 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
         if s > 0:
             impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
 
-    carry_pct = 0.0
-    incr_pct = float(sum(impact_map.values()))
-    total_pct = base_pct + carry_pct + incr_pct
-    if abs(total_pct - 100.0) > 0.1 and incr_pct > 0:
-        scale = max(0.0, 100.0 - base_pct - carry_pct) / incr_pct
-        for k in list(impact_map.keys()):
-            impact_map[k] = impact_map[k] * scale
-        incr_pct = float(sum(impact_map.values()))
+    d2 = {"base_pct": base_pct, "carryover_pct": 0.0, "incremental_pct": float(sum(impact_map.values())), "impactable_pct": impact_map}
+    return _normalize_and_round(d2)
 
+def _normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
+    base_pct = float(d.get("base_pct", 0.0))
+    carry_pct = float(d.get("carryover_pct", 0.0))
+    impact_map: Dict[str, float] = dict(d.get("impactable_pct", {}))
+    incr_pct = float(sum(impact_map.values()))
+    total = base_pct + carry_pct + incr_pct
+    if incr_pct > 0 and abs(total - 100.0) > 0.05:
+        target_incr = max(0.0, 100.0 - base_pct - carry_pct)
+        scale = target_incr / incr_pct if incr_pct > 0 else 1.0
+        for k in list(impact_map.keys()):
+            impact_map[k] *= scale
+        incr_pct = float(sum(impact_map.values()))
     base_pct = float(round(base_pct, 6))
-    incr_pct = float(round(incr_pct, 6))
     carry_pct = float(round(carry_pct, 6))
     impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
+    incr_pct = float(round(sum(impact_map.values()), 6))
+    return {"base_pct": base_pct, "carryover_pct": carry_pct, "incremental_pct": incr_pct, "impactable_pct": impact_map}
 
+def _short_type(t: str) -> str:
     return {
-        "base_pct": base_pct,
-        "carryover_pct": carry_pct,
-        "incremental_pct": incr_pct,
-        "impactable_pct": impact_map
-    }
+        "base": "base",
+        "breakout_split": "breakout",
+        "residual_reattribute": "residual",
+        "pathway_redistribute": "pathway",
+    }.get(str(t), str(t) or "base")
+
+def _fmt_label(r: Dict[str, Any]) -> str:
+    nm = r.get("name","(unnamed)")
+    tp = _short_type(r.get("type","base"))
+    tgt = r.get("target","?")
+    ts = r.get("_ts")
+    when = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "—"
+    return f"{nm} • {tp} • {tgt} • {when}"
 
 # ---------------------------
 # Load catalog
@@ -187,14 +156,12 @@ if not catalog:
     st.info("No saved models yet. Build a model in **Modeling**, then come back here.")
     st.stop()
 
-# Sidebar-like scroller of all runs
 st.markdown("#### All runs (latest first)")
 summary_rows = []
 for r in catalog:
     summary_rows.append({
         "Name": r.get("name",""),
         "Type": _short_type(r.get("type","base")),
-        "Dataset": r.get("dataset",""),
         "Target": r.get("target",""),
         "Saved at": r.get("_ts").strftime("%Y-%m-%d %H:%M:%S") if r.get("_ts") else "",
     })
@@ -206,124 +173,84 @@ st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=min(40
 labels = [_fmt_label(r) for r in catalog]
 default_sel = labels[:2] if len(labels) >= 2 else labels[:1]
 chosen = st.multiselect("Select up to 5 models to compare", options=labels, default=default_sel, max_selections=5)
-
 if not chosen:
     st.stop()
 
 models = [catalog[labels.index(lbl)] for lbl in chosen]
-baseline_idx = 0
-baseline = st.selectbox("Baseline for Δ calculations", options=chosen, index=baseline_idx)
+baseline = st.selectbox("Baseline for Δ", options=chosen, index=0)
 baseline_rec = models[chosen.index(baseline)]
 
 st.divider()
 
 # ---------------------------
-# Top-level metrics table
+# Fit metrics
 # ---------------------------
 st.subheader("Fit metrics")
 met = []
 for lbl, r in zip(chosen, models):
-    row = _metrics_row(r)
-    row["Model"] = lbl
+    row = _metrics_row(r); row["Model"] = lbl
     met.append(row)
 met_df = pd.DataFrame(met).set_index("Model")
 st.dataframe(met_df, use_container_width=True)
 
 # ---------------------------
-# Decomposition summary (Base / Carryover / Incremental)
+# Decomposition summary
 # ---------------------------
 st.subheader("Decomposition summary")
+decomp_map = {lbl: _ensure_decomp(r) for lbl, r in zip(chosen, models)}
 decomp_rows = []
-decomp_map = {}
-for lbl, r in zip(chosen, models):
-    d = _ensure_decomp(r)
-    decomp_map[lbl] = d
-    decomp_rows.append({
-        "Model": lbl,
-        "Base %": _to_pct(d.get("base_pct")),
-        "Carryover %": _to_pct(d.get("carryover_pct")),
-        "Incremental %": _to_pct(d.get("incremental_pct")),
-    })
+for lbl in chosen:
+    d = decomp_map[lbl]
+    decomp_rows.append({"Model": lbl, "Base %": d["base_pct"], "Carryover %": d["carryover_pct"], "Incremental %": d["incremental_pct"]})
 decomp_df = pd.DataFrame(decomp_rows).set_index("Model")
 st.dataframe(decomp_df, use_container_width=True)
-
-# Quick chart (stacked feel via separate bars)
 st.bar_chart(decomp_df)
 
 # ---------------------------
-# Impactable % by channel (aligned across models)
+# Impactable % by channel — aligned
 # ---------------------------
-st.subheader("Impactable % by channel — aligned across models")
-
-def _union_channels(models: List[Dict[str, Any]]) -> List[str]:
-    names = set()
-    for r in models:
-        d = _ensure_decomp(r)
-        imp = d.get("impactable_pct", {}) or {}
-        names.update(imp.keys())
-    return sorted(names)
-
-channels = _union_channels(models)
+st.subheader("Impactable % by channel — aligned")
+channels = sorted({ch for d in decomp_map.values() for ch in d.get("impactable_pct", {}).keys()})
 if not channels:
-    st.info("No per-channel impactable breakdown available in selected models.")
+    st.info("No per-channel impactable breakdown in selected models.")
 else:
-    # Build a matrix: rows = Channel, columns = Model, values = %
     mat = []
     for ch in channels:
         row = {"Channel": ch}
-        for lbl, r in zip(chosen, models):
-            imp = (decomp_map.get(lbl) or {}).get("impactable_pct", {}) or _ensure_decomp(r).get("impactable_pct", {})
-            row[lbl] = _to_pct(imp.get(ch, 0.0))
+        for lbl in chosen:
+            row[lbl] = float(decomp_map[lbl]["impactable_pct"].get(ch, 0.0))
         mat.append(row)
     impact_df = pd.DataFrame(mat).set_index("Channel")
-
-    # Reorder columns to match user's chosen order
-    impact_df = impact_df[[lbl for lbl in chosen]]
-
     st.dataframe(impact_df, use_container_width=True)
 
-    # Per-channel chart vs baseline
     st.markdown("**Δ vs baseline (selected above)**")
-    base_col = baseline
-    if base_col in impact_df.columns:
-        deltas = impact_df.subtract(impact_df[base_col], axis=0)
+    if baseline in impact_df.columns:
+        deltas = impact_df.subtract(impact_df[baseline], axis=0)
         st.dataframe(deltas, use_container_width=True)
-    else:
-        st.caption("Baseline not in columns? (unexpected)")
 
 # ---------------------------
-# Download comparison
+# Export
 # ---------------------------
 st.subheader("Export")
-# Merge all tables into one CSV (wide)
-export_parts = []
-met_wide = met_df.reset_index().rename(columns={"index":"Model"})
-decomp_wide = decomp_df.reset_index()
-export_parts.append(("metrics", met_wide))
-export_parts.append(("decomposition", decomp_wide))
-if 'impact_df' in locals():
-    export_parts.append(("impactable_by_channel", impact_df.reset_index()))
-
 from io import StringIO
 csv_buf = StringIO()
-for name, dfp in export_parts:
-    csv_buf.write(f"## {name}\n")
-    dfp.to_csv(csv_buf, index=False)
-    csv_buf.write("\n")
+csv_buf.write("## metrics\n"); met_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
+csv_buf.write("## decomposition\n"); decomp_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
+if 'impact_df' in locals():
+    csv_buf.write("## impactable_by_channel\n"); impact_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
 csv_bytes = csv_buf.getvalue().encode("utf-8")
 st.download_button("Download comparison CSV", data=csv_bytes, file_name="mmm_results_comparison.csv", mime="text/csv")
 
 # ---------------------------
-# Hand off to Budget Optimization
+# Handoff to Budget Optimization
 # ---------------------------
 st.subheader("Select for Budget Optimization")
-st.caption("Choose any models here; they’ll be available on the Budget page as `budget_candidates`.")
-to_budget = st.multiselect("Models to send", options=chosen, default=chosen[: min(3, len(chosen))])
+to_budget = st.multiselect("Models to send", options=chosen, default=chosen[:min(3, len(chosen))])
 if st.button("Send to Budget Optimization"):
-    selected_records = [models[chosen.index(lbl)] for lbl in to_budget]
     skinny = []
-    for r in selected_records:
-        d = _ensure_decomp(r)
+    for lbl in to_budget:
+        r = models[chosen.index(lbl)]
+        d = decomp_map[lbl]
         skinny.append({
             "name": r.get("name"),
             "type": r.get("type"),
@@ -337,4 +264,3 @@ if st.button("Send to Budget Optimization"):
         })
     st.session_state["budget_candidates"] = skinny
     st.success(f"Sent {len(skinny)} model(s) to Budget Optimization.")
-    st.caption("Open the **Budget Optimization** page to use them.")
