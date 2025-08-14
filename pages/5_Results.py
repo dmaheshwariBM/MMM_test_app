@@ -44,6 +44,11 @@ def _metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
     m = r.get("metrics", {}) or {}
     return {"R²": m.get("r2"), "Adj R²": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
 
+def _intercept_key(coef: Dict[str, float]) -> str | None:
+    for k in ("const", "Intercept", "intercept", "CONST", "const_", "_const", "beta0", "b0"):
+        if k in coef: return k
+    return None
+
 def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
     if name == "const":
         return pd.Series(np.ones(len(df)), index=df.index, name="const")
@@ -53,10 +58,29 @@ def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
         return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
     return pd.Series(np.zeros(len(df)), index=df.index, name=name)
 
+def _normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
+    base_pct = float(d.get("base_pct", 0.0))
+    carry_pct = float(d.get("carryover_pct", 0.0))
+    impact_map: Dict[str, float] = dict(d.get("impactable_pct", {}))
+    incr_pct = float(sum(impact_map.values()))
+    total = base_pct + carry_pct + incr_pct
+    if incr_pct > 0 and abs(total - 100.0) > 0.05:
+        target_incr = max(0.0, 100.0 - base_pct - carry_pct)
+        scale = target_incr / incr_pct if incr_pct > 0 else 1.0
+        for k in list(impact_map.keys()):
+            impact_map[k] *= scale
+        incr_pct = float(sum(impact_map.values()))
+    base_pct = float(round(base_pct, 6))
+    carry_pct = float(round(carry_pct, 6))
+    impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
+    incr_pct = float(round(sum(impact_map.values()), 6))
+    return {"base_pct": base_pct, "carryover_pct": carry_pct, "incremental_pct": incr_pct, "impactable_pct": impact_map}
+
 def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     """
     Robust decomp for display:
       Denominator: sum(target) → sum(yhat) → sum(contrib) → 1.0
+      Detect intercept (const/Intercept/...) even if features omitted it.
       Normalize so Base+Carry+Incremental ≈ 100
     """
     d = record.get("decomp")
@@ -79,16 +103,20 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
 
-    # Build contributions
+    # Build contributions (include intercept even if not in features)
     contrib_sum: Dict[str, float] = {}
+    n = len(df)
+    ik = _intercept_key(coef)
+    if ik is not None:
+        contrib_sum["const"] = float(coef.get(ik, 0.0)) * n
+
     for f in features:
-        c = float(coef.get(f, 0.0))
         if f == "const":
-            s = float((c * np.ones(len(df))).sum())
-        else:
-            x = _to_num_series(df, f)
-            s = float((c * x).clip(lower=0.0).sum())
-        contrib_sum[f] = s
+            # already included via ik
+            continue
+        c = float(coef.get(f, 0.0))
+        x = _to_num_series(df, f)
+        contrib_sum[f] = float((c * x).clip(lower=0.0).sum())
 
     # Denominator
     total_from_y = None
@@ -111,26 +139,7 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
         if s > 0:
             impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
 
-    d2 = {"base_pct": base_pct, "carryover_pct": 0.0, "incremental_pct": float(sum(impact_map.values())), "impactable_pct": impact_map}
-    return _normalize_and_round(d2)
-
-def _normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
-    base_pct = float(d.get("base_pct", 0.0))
-    carry_pct = float(d.get("carryover_pct", 0.0))
-    impact_map: Dict[str, float] = dict(d.get("impactable_pct", {}))
-    incr_pct = float(sum(impact_map.values()))
-    total = base_pct + carry_pct + incr_pct
-    if incr_pct > 0 and abs(total - 100.0) > 0.05:
-        target_incr = max(0.0, 100.0 - base_pct - carry_pct)
-        scale = target_incr / incr_pct if incr_pct > 0 else 1.0
-        for k in list(impact_map.keys()):
-            impact_map[k] *= scale
-        incr_pct = float(sum(impact_map.values()))
-    base_pct = float(round(base_pct, 6))
-    carry_pct = float(round(carry_pct, 6))
-    impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
-    incr_pct = float(round(sum(impact_map.values()), 6))
-    return {"base_pct": base_pct, "carryover_pct": carry_pct, "incremental_pct": incr_pct, "impactable_pct": impact_map}
+    return _normalize_and_round({"base_pct": base_pct, "carryover_pct": 0.0, "incremental_pct": float(sum(impact_map.values())), "impactable_pct": impact_map})
 
 def _short_type(t: str) -> str:
     return {
