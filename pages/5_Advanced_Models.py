@@ -1,5 +1,5 @@
 # pages/5_Advanced_Models.py
-import os, json, glob, re, importlib.util, pathlib
+import os, json, glob, re, pathlib, importlib
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -7,8 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "ADVANCED_MODELS_PAGE_v2_3_0"
-
+PAGE_ID = "ADVANCED_MODELS_PAGE_v2_4_1"
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
 st.caption(f"Page ID: `{PAGE_ID}`")
 
@@ -17,18 +16,38 @@ RESULTS_DIR = "results"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# ---------------------------------------------------------------------------------------
-# Force-load *local* core/advanced_models.py by file path (avoids any 'core' name clash)
-# ---------------------------------------------------------------------------------------
-CORE_PATH = pathlib.Path("core/advanced_models.py").resolve()
-if not CORE_PATH.exists():
-    st.error(f"Expected file not found: {CORE_PATH}")
-    st.stop()
+# ---- Import core with fallback to file-path load (core stays pure python) ----
+def _import_advanced_models():
+    try:
+        from core import advanced_models as am  # type: ignore
+        return am
+    except Exception:
+        pass
+    # fallback: load by path
+    core_path = pathlib.Path("core/advanced_models.py").resolve()
+    if not core_path.exists():
+        st.error(f"Expected file not found: {core_path}")
+        st.stop()
+    spec = importlib.util.spec_from_file_location("advanced_models_local", core_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)  # type: ignore
+    return module
 
-_spec = importlib.util.spec_from_file_location("advanced_models_local", CORE_PATH)
-am = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(am)  # type: ignore
-st.caption(f"Loaded advanced_models from: `{getattr(am, '__file__', 'unknown')}` (core version: {getattr(am, 'ADV_MODELS_VERSION', 'unknown')})")
+am = _import_advanced_models()
+st.caption(f"Loaded advanced_models from: `{getattr(am, '__file__', 'unknown')}` (core v {getattr(am, 'ADV_MODELS_VERSION', 'unknown')})")
+
+REQUIRED_FUNCS = [
+    "breakout_split",
+    "residual_reattribute",
+    "pathway_redistribute",
+    "apply_decomp_update",
+    "_ensure_decomp_from_record_or_recompute",
+]
+missing = [fn for fn in REQUIRED_FUNCS if not hasattr(am, fn)]
+if missing:
+    st.error(f"`advanced_models` missing: {', '.join(missing)}")
+    st.stop()
 
 # ---------------------------
 # Helpers
@@ -74,7 +93,6 @@ def _persist_record(model_name: str, target: str, dataset: str, record: Dict[str
     return out_dir
 
 def _overwrite_base(base_name: str, new_decomp: Dict[str, Any]) -> None:
-    """Replace only the decomp in the JSON with name==base_name."""
     for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
         try:
             with open(jf, "r") as f:
@@ -99,21 +117,6 @@ def _render_decomp(decomp: Dict[str, Any]):
     if imp:
         dfv = pd.DataFrame({"Channel": list(imp.keys()), "Impactable %": list(imp.values())})
         st.bar_chart(dfv.set_index("Channel"))
-
-# ---------------------------
-# Guards
-# ---------------------------
-REQUIRED_FUNCS = [
-    "breakout_split",
-    "residual_reattribute",
-    "pathway_redistribute",
-    "apply_decomp_update",
-    "_ensure_decomp_from_record_or_recompute",
-]
-missing = [fn for fn in REQUIRED_FUNCS if not hasattr(am, fn)]
-if missing:
-    st.error(f"`advanced_models.py` missing: {', '.join(missing)}\nLoaded from: {getattr(am, '__file__', 'unknown')}")
-    st.stop()
 
 # ---------------------------
 # Pick base model
@@ -142,7 +145,7 @@ st.caption(f"Dataset: **{base['dataset']}** • Target: **{base.get('target','?'
 st.info(f"Base % (current): **{float(decomp0.get('base_pct',0)):.2f}%**")
 
 # ---------------------------
-# Tabs (Advanced Models only)
+# Tabs
 # ---------------------------
 tab1, tab2, tab3 = st.tabs(["📊 Breakout split", "➕ Residual (on Base)", "🧩 Pathway redistribution"])
 
@@ -171,13 +174,12 @@ with tab1:
                     _overwrite_base(base["name"], new_decomp)
                     st.success("Base model updated.")
         except Exception as e:
-            st.error("Breakout failed.")
-            st.exception(e)
+            st.error("Breakout failed."); st.exception(e)
 
 # ===== Residual (on Base) =====
 with tab2:
     st.subheader("Residual re-attribution (regress Base on new channels)")
-    st.caption("We fit the **Base (intercept)** series on selected channels. The **fitted share of Base** is moved from Base% to those channels (split by fitted contributions).")
+    st.caption("Fit the **Base (intercept)** series on selected channels. The **fitted share of Base** is moved from Base% to those channels (split by fitted contributions).")
 
     extra = st.multiselect("Channels to explain Base (not in base model)", options=[c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))])
     frac = st.slider("Apply what fraction of the *fitted* Base to reattribute?", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
@@ -187,6 +189,7 @@ with tab2:
             out = am.residual_reattribute(df=df, base_record=base, extra_channels=extra, fraction=frac)
             new_decomp = am.apply_decomp_update(base, df, out)
             st.success(f"Residual computed. Fitted share of Base = {out['fitted_share_of_base']*100:.1f}%. Applied fraction = {out['fraction']*100:.0f}%.")
+
             st.write(pd.DataFrame([{
                 "Base % before": out["base_pct_before"],
                 "Base % after": out["base_pct_after"],
@@ -208,8 +211,7 @@ with tab2:
                     _overwrite_base(base["name"], new_decomp)
                     st.success("Base model updated.")
         except Exception as e:
-            st.error("Residual re-attribution failed.")
-            st.exception(e)
+            st.error("Residual re-attribution failed."); st.exception(e)
 
 # ===== Pathway redistribution =====
 with tab3:
@@ -244,5 +246,4 @@ with tab3:
                         _overwrite_base(base["name"], new_decomp)
                         st.success("Base model updated.")
             except Exception as e:
-                st.error("Pathway redistribution failed.")
-                st.exception(e)
+                st.error("Pathway redistribution failed."); st.exception(e)
