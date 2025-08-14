@@ -1,43 +1,41 @@
 # core/advanced_models.py
-"""
-Advanced MMM post-processing utilities
-Version: 2.4.1
+# v1.4.0  ASCII-only. Deterministic, dependency-light advanced adjustments.
+# Implements:
+#   - _ensure_decomp_from_record_or_recompute(record, df)
+#   - breakout_split(df, base_record, channel_to_split, sub_metrics)
+#   - residual_reattribute(df, base_record, extra_channels, fraction=1.0)
+#   - pathway_redistribute(df, base_record, channel_A, channel_B)
+#   - apply_decomp_update(base_record, df, new_decomp)
 
-Workflows:
-- breakout_split: re-split one base channel’s impact into selected sub-metrics (no intercept; sum preserved)
-- residual_reattribute: regress the BASE (intercept) series on selected channels; reattribute the *fitted share* of Base
-- pathway_redistribute: move a share of Channel A’s impact to Channel B; totals preserved
-- apply_decomp_update: apply any of the above updates to a base record’s decomposition
-- _ensure_decomp_from_record_or_recompute: robust decomp if missing (stable denominator + intercept detection)
-
-All NumPy/Pandas; no Streamlit or importlib here.
-"""
-from __future__ import annotations
-import re
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import numpy as np
 import pandas as pd
 
-__all__ = [
-    "ADV_MODELS_VERSION",
-    "breakout_split",
-    "residual_reattribute",
-    "pathway_redistribute",
-    "apply_decomp_update",
-    "_ensure_decomp_from_record_or_recompute",
-    "_normalize_and_round_decomp",
-]
+try:
+    from core import modeling
+except Exception:
+    modeling = None  # the page guards for this
 
-ADV_MODELS_VERSION = "2.4.1"
+ADV_MODELS_VERSION = "1.4.0"
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _safe(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
-
-def _to_num(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce").fillna(0.0)
+def _norm_decomp(d: Dict[str, Any]) -> Dict[str, Any]:
+    base = float(d.get("base_pct", 0.0))
+    carry = float(d.get("carryover_pct", 0.0))
+    impact = {str(k): float(v) for k, v in dict(d.get("impactable_pct", {})).items()}
+    incr = float(sum(impact.values()))
+    total = base + carry + incr
+    if incr > 0 and abs(total - 100.0) > 0.05:
+        target_incr = max(0.0, 100.0 - base - carry)
+        scale = target_incr / incr if incr > 0 else 1.0
+        for k in list(impact.keys()):
+            impact[k] = impact[k] * scale
+        incr = float(sum(impact.values()))
+    return {
+        "base_pct": float(round(base, 6)),
+        "carryover_pct": float(round(carry, 6)),
+        "incremental_pct": float(round(incr, 6)),
+        "impactable_pct": {k: float(round(v, 6)) for k, v in impact.items()},
+    }
 
 def _intercept_key(coef: Dict[str, float]) -> Optional[str]:
     for k in ("const", "Intercept", "intercept", "CONST", "const_", "_const", "beta0", "b0"):
@@ -45,400 +43,191 @@ def _intercept_key(coef: Dict[str, float]) -> Optional[str]:
             return k
     return None
 
-def _feature_series(df: pd.DataFrame, name: str) -> pd.Series:
-    """Return feature series from df. If name=='const', return a 1s vector."""
-    if name == "const":
-        return pd.Series(np.ones(len(df)), index=df.index, name="const")
-    if name in df.columns:
-        return _to_num(df[name])
-    if name.endswith("__tfm") and name[:-5] in df.columns:
-        return _to_num(df[name[:-5]])
-    return pd.Series(np.zeros(len(df)), index=df.index, name=name)
-
-def _contrib_series(df: pd.DataFrame, coef: Dict[str, float], features: List[str]) -> Dict[str, pd.Series]:
-    """Contribution time series for each feature: coef_j * x_j(t). Includes intercept as 'const' if present."""
-    out: Dict[str, pd.Series] = {}
-    n = len(df)
-    ik = _intercept_key(coef)
-    if ik is not None:
-        out["const"] = float(coef.get(ik, 0.0)) * pd.Series(np.ones(n), index=df.index)
-    for f in features:
-        if f == "const":
-            continue
-        c = float(coef.get(f, 0.0))
-        out[f] = c * _feature_series(df, f)
-    return out
-
-# ---------------------------
-# Robust decomp
-# ---------------------------
 def _ensure_decomp_from_record_or_recompute(record: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Ensure 'decomp' exists. If missing, recompute a minimal one:
-      - base_pct from intercept ('const') share
-      - impactable_pct from positive contributions of non-const features
-      - carryover_pct set to 0
-
-    Denominator priority:
-      1) sum(actual target) if available
-      2) sum(yhat) if > 0
-      3) sum(all contributions, incl. const)
-      4) 1.0
-    """
+    """Return a normalized decomp; compute from coef if not present."""
     d = record.get("decomp")
     if isinstance(d, dict) and "impactable_pct" in d:
-        return _normalize_and_round_decomp(d)
+        return _norm_decomp(d)
 
-    coef = record.get("coef", {}) or {}
-    features = record.get("features", []) or []
-    contrib = _contrib_series(df, coef, features)
+    # recompute from coef/features if modeling is available
+    if modeling is None:
+        return {"base_pct": float("nan"), "carryover_pct": 0.0, "incremental_pct": float("nan"), "impactable_pct": {}}
 
-    # Denominator candidates
-    total_from_y = None
-    tgt = record.get("target")
-    if tgt and tgt in df.columns:
-        total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
+    features = list(record.get("features", []) or [])
+    coef = dict(record.get("coef", {}) or {})
+    target = record.get("target")
+    yhat = record.get("yhat")
+    try:
+        return modeling.compute_decomposition(df, coef, features, target=target, yhat=yhat)
+    except Exception:
+        return {"base_pct": float("nan"), "carryover_pct": 0.0, "incremental_pct": float("nan"), "impactable_pct": {}}
 
-    yhat = np.asarray(record.get("yhat", []), float)
-    total_from_yhat = float(np.nansum(yhat)) if yhat.size > 0 else 0.0
-
-    total_from_contrib = float(sum(float(s.sum()) for s in contrib.values())) if contrib else 0.0
-    candidates = [t for t in (total_from_y, total_from_yhat, total_from_contrib) if t and t > 0]
-    total_pred = candidates[0] if candidates else 1.0
-
-    base_sum = float(contrib.get("const", pd.Series(0.0, index=df.index)).sum())
-    base_pct = 100.0 * base_sum / total_pred
-
-    impact_map: Dict[str, float] = {}
-    for f, s in contrib.items():
-        if f == "const":
-            continue
-        val = float((s.clip(lower=0.0)).sum())
-        if val <= 0:
-            continue
-        disp = f[:-5] if f.endswith("__tfm") else f
-        impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * val / total_pred
-
-    new_decomp = {
-        "base_pct": base_pct,
-        "carryover_pct": 0.0,
-        "incremental_pct": float(sum(impact_map.values())),
-        "impactable_pct": impact_map
-    }
-    return _normalize_and_round_decomp(new_decomp)
-
-def _normalize_and_round_decomp(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure Base% + Carryover% + Incremental% = 100 (± rounding), and round nicely."""
-    base_pct = float(d.get("base_pct", 0.0))
-    carry_pct = float(d.get("carryover_pct", 0.0))
-    impact_map: Dict[str, float] = dict(d.get("impactable_pct", {}))
-    incr_pct = float(sum(impact_map.values()))
-
-    total = base_pct + carry_pct + incr_pct
-    if incr_pct > 0 and abs(total - 100.0) > 0.05:
-        target_incr = max(0.0, 100.0 - base_pct - carry_pct)
-        scale = target_incr / incr_pct if incr_pct > 0 else 1.0
-        for k in list(impact_map.keys()):
-            impact_map[k] *= scale
-        incr_pct = float(sum(impact_map.values()))
-
-    base_pct = float(round(base_pct, 6))
-    carry_pct = float(round(carry_pct, 6))
-    impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
-    incr_pct = float(round(sum(impact_map.values()), 6))
-    return {
-        "base_pct": base_pct,
-        "carryover_pct": carry_pct,
-        "incremental_pct": incr_pct,
-        "impactable_pct": impact_map
-    }
-
-# ---------------------------
-# Breakout split
-# ---------------------------
 def breakout_split(
     df: pd.DataFrame,
     base_record: Dict[str, Any],
     channel_to_split: str,
-    sub_metrics: List[str],
+    sub_metrics: List[str]
 ) -> Dict[str, Any]:
     """
-    Redistribute one channel’s impact across chosen sub-metrics. Totals preserved.
-    Fit: y_parent_contrib ≈ X_sub w   (no intercept), w>=0 (via clipping).
+    Split the impact of channel_to_split across sub_metrics (no intercept involved).
+    Weights are proportional to the positive sum of each sub metric over the train window.
+    If all sums are zero, split equally.
     """
-    coef = base_record.get("coef", {}) or {}
-    features = [f for f in base_record.get("features", []) or [] if f != "const"]
-    # find actual feature name
-    parent_feat: Optional[str] = None
-    for f in features:
-        disp = f[:-5] if f.endswith("__tfm") else f
-        if disp == channel_to_split:
-            parent_feat = f; break
-    if parent_feat is None:
-        raise ValueError(f"Channel '{channel_to_split}' not found in base features.")
+    # get current decomp
+    cur = _ensure_decomp_from_record_or_recompute(base_record, df)
+    impact = dict(cur.get("impactable_pct", {}))
+    parent = channel_to_split
+    if parent not in impact:
+        # nothing to split; return unchanged
+        return cur
 
-    decomp = _ensure_decomp_from_record_or_recompute(base_record, df)
-    parent_pct = float(decomp.get("impactable_pct", {}).get(channel_to_split, 0.0))
-    if parent_pct <= 0:
-        return {
-            "type": "breakout_split",
-            "split_channel": channel_to_split,
-            "original_channel_pct": 0.0,
-            "allocated": {},
-            "note": "Parent impact is 0; nothing to split."
-        }
+    parent_pct = float(impact.get(parent, 0.0))
+    if parent_pct <= 0.0 or not sub_metrics:
+        return cur
 
-    # y = parent contribution
-    y = (float(coef.get(parent_feat, 0.0)) * _feature_series(df, parent_feat)).values.astype(float)
-    y = np.maximum(y, 0.0)
+    # compute weights for subs
+    sums = []
+    for s in sub_metrics:
+        if s in df.columns:
+            v = pd.to_numeric(df[s], errors="coerce").fillna(0.0)
+            sums.append(float(np.sum(np.maximum(v.values, 0.0))))
+        else:
+            sums.append(0.0)
 
-    # X = sub metrics
-    X_cols: List[np.ndarray] = []
-    names: List[str] = []
-    for m in sub_metrics:
-        col = f"{m}__tfm" if f"{m}__tfm" in df.columns else m
-        s = _feature_series(df, col).values.astype(float)
-        s = np.maximum(s, 0.0)
-        if s.sum() <= 0:
-            continue
-        X_cols.append(s); names.append(m)
-    if not X_cols:
-        raise ValueError("No valid sub-metric series found (zero or missing).")
+    total = float(sum(sums))
+    if total <= 0.0:
+        # equal split if no signal
+        w = [1.0 / len(sub_metrics)] * len(sub_metrics)
+    else:
+        w = [x / total for x in sums]
 
-    X = np.column_stack(X_cols)
-    try:
-        w, *_ = np.linalg.lstsq(X, y, rcond=None)
-        w = np.maximum(w, 0.0)
-    except Exception:
-        w = np.maximum(np.array([c.mean() for c in X_cols], dtype=float), 0.0)
+    # build new impact map
+    new_imp = {k: float(v) for k, v in impact.items() if k != parent}
+    for s, wi in zip(sub_metrics, w):
+        new_imp[s] = new_imp.get(s, 0.0) + parent_pct * wi
 
-    comp = np.array([w[j] * X_cols[j].mean() for j in range(len(X_cols))], dtype=float)
-    denom = float(np.sum(comp))
-    shares = (comp / denom) if denom > 1e-12 else np.ones_like(comp) / len(comp)
+    return _norm_decomp({
+        "base_pct": cur.get("base_pct", 0.0),
+        "carryover_pct": cur.get("carryover_pct", 0.0),
+        "impactable_pct": new_imp
+    })
 
-    allocated = {names[j]: float(parent_pct * shares[j]) for j in range(len(names))}
-    return {
-        "type": "breakout_split",
-        "split_channel": channel_to_split,
-        "original_channel_pct": parent_pct,
-        "allocated": allocated,
-        "note": "Sub-metric % add up to the original channel impact."
-    }
-
-# ---------------------------
-# Residual re-attribution
-# ---------------------------
 def residual_reattribute(
     df: pd.DataFrame,
     base_record: Dict[str, Any],
     extra_channels: List[str],
-    fraction: float = 1.0,
+    fraction: float = 1.0
 ) -> Dict[str, Any]:
     """
-    Fit the Base (intercept) series on selected channels:
-        base(t) ≈ Σ_j w_j * X_j(t)   (no intercept, w>=0 via clipping)
-    Allocate (fraction * fitted_share_of_base) of Base% to the channels by fitted shares.
+    Reallocate a fraction of the fitted Base (intercept) into extra channels that were not in the base model.
+    Approach (deterministic and dependency-light):
+      - Let base_pct be the current base impact percentage.
+      - Build a "base series" per row: intercept contribution per row = coef['const'] (or 0).
+      - Regress base_series on extras (OLS), clip negative betas at zero.
+      - Weight each extra by its predicted share; allocate base_pct * fraction by those weights.
+      - Reduce base_pct accordingly; add the allocated share to the extras (create if missing).
     """
-    fraction = max(0.0, min(1.0, float(fraction)))
-    d0 = _ensure_decomp_from_record_or_recompute(base_record, df)
-    base_pct_before = float(d0.get("base_pct", 0.0))
+    cur = _ensure_decomp_from_record_or_recompute(base_record, df)
+    impact = dict(cur.get("impactable_pct", {}))
+    base_pct = float(cur.get("base_pct", 0.0))
+    if base_pct <= 0.0 or not extra_channels:
+        return cur
 
-    coef = base_record.get("coef", {}) or {}
-    features = base_record.get("features", []) or []
+    coef = dict(base_record.get("coef", {}) or {})
     ik = _intercept_key(coef)
+    const_val = float(coef.get(ik, 0.0)) if ik is not None else 0.0
+
     n = len(df)
+    base_series = np.full(n, max(0.0, const_val), dtype=float)  # nonnegative per-row intercept contribution
 
-    # Build base series
-    if ik is not None:
-        intercept_val = float(coef.get(ik, 0.0))
-        base_series = pd.Series(np.full(n, intercept_val), index=df.index, name="base_intercept")
-    else:
-        # Reconstruct flat base to match Base%
-        tgt = base_record.get("target")
-        candidates = []
-        if tgt and tgt in df.columns:
-            candidates.append(float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum()))
-        yhat = np.asarray(base_record.get("yhat", []), float)
-        if yhat.size > 0:
-            candidates.append(float(np.nansum(yhat)))
-        contrib_total = 0.0
-        for f in features:
-            if f == "const": continue
-            c = float(coef.get(f, 0.0))
-            contrib_total += float((c * _feature_series(df, f)).clip(lower=0.0).sum())
-        candidates.append(contrib_total if contrib_total > 0 else 0.0)
-        denom = next((t for t in candidates if t and t > 0), 1.0)
-        base_total_level = denom * (base_pct_before / 100.0)
-        base_series = pd.Series(np.full(n, base_total_level / max(n, 1)), index=df.index, name="base_flat")
-
-    base_sum = float(base_series.sum())
-    if base_sum <= 0 or base_pct_before <= 0:
-        return {"type": "residual_reattribute", "base_pct_before": base_pct_before,
-                "fraction": 0.0, "fitted_share_of_base": 0.0, "allocated": {},
-                "base_pct_after": base_pct_before, "note": "No base available to reattribute."}
-
-    # X matrix from extra channels
-    X_cols: List[np.ndarray] = []
-    names: List[str] = []
+    # design for extras
+    X = []
+    valid_cols = []
     for c in extra_channels:
-        col = f"{c}__tfm" if f"{c}__tfm" in df.columns else c
-        s = _feature_series(df, col).values.astype(float)
-        s = np.maximum(s, 0.0)
-        mx = float(s.max()) if s.size else 0.0
-        if mx <= 0: continue
-        X_cols.append(s / mx); names.append(c)
-    if not X_cols:
-        raise ValueError("No valid extra channel series found to reattribute base.")
+        if c in df.columns:
+            col = pd.to_numeric(df[c], errors="coerce").fillna(0.0).values.astype(float)
+            X.append(col)
+            valid_cols.append(c)
+    if not X:
+        return cur
+    X = np.vstack(X).T  # shape (n, k)
 
-    X = np.column_stack(X_cols)
-    y = base_series.values.astype(float)
+    # OLS then clip negatives to zero, refit intercept for base_series (not needed here for weights)
+    beta, *_ = np.linalg.lstsq(X, base_series, rcond=None)
+    beta = np.maximum(beta, 0.0)
+    preds = X.dot(beta)  # k extras combined
+    if float(np.sum(preds)) <= 0.0:
+        # fallback: equal weights
+        w = [1.0 / len(valid_cols)] * len(valid_cols)
+    else:
+        # weight each extra by its standalone positive contribution norm
+        indiv = []
+        for j in range(len(valid_cols)):
+            pj = np.maximum(X[:, j] * beta[j], 0.0)
+            indiv.append(float(np.sum(pj)))
+        s = float(sum(indiv))
+        if s <= 0.0:
+            w = [1.0 / len(valid_cols)] * len(valid_cols)
+        else:
+            w = [x / s for x in indiv]
 
-    try:
-        w, *_ = np.linalg.lstsq(X, y, rcond=None)
-        w = np.maximum(w, 0.0)
-    except Exception:
-        w = np.maximum(np.ones((X.shape[1],), dtype=float), 0.0)
+    frac = float(max(0.0, min(1.0, fraction)))
+    allocate = base_pct * frac
 
-    yhat = X @ w
-    yhat_sum = float(np.sum(np.maximum(yhat, 0.0)))
-    fitted_share = float(max(0.0, min(1.0, yhat_sum / base_sum)))
+    new_base = base_pct - allocate
+    new_imp = {k: float(v) for k, v in impact.items()}
+    for c, wi in zip(valid_cols, w):
+        new_imp[c] = new_imp.get(c, 0.0) + allocate * wi
 
-    per_ch_sum = []
-    for j in range(X.shape[1]):
-        yj = np.maximum(w[j] * X[:, j], 0.0)
-        per_ch_sum.append(float(np.sum(yj)))
-    per_ch_sum = np.array(per_ch_sum, dtype=float)
-    denom = float(per_ch_sum.sum())
-    shares = per_ch_sum / denom if denom > 1e-12 else np.ones_like(per_ch_sum) / len(per_ch_sum)
+    return _norm_decomp({
+        "base_pct": new_base,
+        "carryover_pct": cur.get("carryover_pct", 0.0),
+        "impactable_pct": new_imp
+    })
 
-    total_alloc_pct = base_pct_before * fitted_share * fraction
-    allocated = {names[j]: float(total_alloc_pct * shares[j]) for j in range(len(names))}
-    base_pct_after = max(0.0, base_pct_before - total_alloc_pct)
-
-    return {
-        "type": "residual_reattribute",
-        "base_pct_before": float(round(base_pct_before, 6)),
-        "fraction": float(round(fraction, 6)),
-        "fitted_share_of_base": float(round(fitted_share, 6)),
-        "allocated": {k: float(round(v, 6)) for k, v in allocated.items()},
-        "base_pct_after": float(round(base_pct_after, 6)),
-        "note": "Allocated pp come out of Base %; Incremental % increases by the same total."
-    }
-
-# ---------------------------
-# Pathway redistribution
-# ---------------------------
 def pathway_redistribute(
     df: pd.DataFrame,
     base_record: Dict[str, Any],
     channel_A: str,
-    channel_B: str,
+    channel_B: str
 ) -> Dict[str, Any]:
     """
-    Share s inferred from nonnegative single-factor fit:
-      contrib_A ≈ w * X_B (no intercept), s = min(1, sum(yhat)/sum(contrib_A))
-    A_new = (1 - s)*A_old;  B_new = B_old + s*A_old
+    Move a fraction s of A's impact to B, where s ~ R^2 from OLS(A ~ B, intercept).
+    This keeps the total incremental share the same across A and B.
     """
-    coef = base_record.get("coef", {}) or {}
-    features = [f for f in base_record.get("features", []) or [] if f != "const"]
-    d0 = _ensure_decomp_from_record_or_recompute(base_record, df)
-    impact_map = dict(d0.get("impactable_pct", {}))
+    cur = _ensure_decomp_from_record_or_recompute(base_record, df)
+    impact = dict(cur.get("impactable_pct", {}))
+    if channel_A not in impact or channel_B not in impact:
+        return cur
 
-    def _find_feat(disp: str) -> Optional[str]:
-        for f in features:
-            nm = f[:-5] if f.endswith("__tfm") else f
-            if nm == disp:
-                return f
-        return None
+    if channel_A not in df.columns or channel_B not in df.columns:
+        return cur
 
-    fA = _find_feat(channel_A)
-    fB = _find_feat(channel_B)
-    if fA is None or fB is None:
-        raise ValueError("Selected channels not found in base features.")
+    a = pd.to_numeric(df[channel_A], errors="coerce").fillna(0.0).values.astype(float)
+    b = pd.to_numeric(df[channel_B], errors="coerce").fillna(0.0).values.astype(float)
+    ones = np.ones((len(a), 1), dtype=float)
+    X = np.hstack([ones, b.reshape(-1,1)])
+    beta, *_ = np.linalg.lstsq(X, a, rcond=None)
+    yhat = X.dot(beta)
+    # R^2
+    ss_res = float(np.sum((a - yhat) ** 2))
+    ss_tot = float(np.sum((a - float(np.mean(a))) ** 2))
+    r2 = 0.0 if ss_tot <= 0 else max(0.0, min(1.0, 1.0 - ss_res / ss_tot))
 
-    y = (float(coef.get(fA, 0.0)) * _feature_series(df, fA)).values.astype(float)
-    y = np.maximum(y, 0.0)
-    Xb = _feature_series(df, fB).values.astype(float)
-    Xb = np.maximum(Xb, 0.0)
+    s = float(r2)  # share to move
+    a_old = float(impact.get(channel_A, 0.0))
+    b_old = float(impact.get(channel_B, 0.0))
+    move = a_old * s
 
-    num = float(np.dot(Xb, y)); den = float(np.dot(Xb, Xb))
-    w = 0.0 if den <= 1e-12 else max(0.0, num / den)
-    yhat = w * Xb
-    s_raw = 0.0 if y.sum() <= 1e-12 else float(np.sum(yhat) / np.sum(y))
-    s = float(max(0.0, min(1.0, s_raw)))
+    impact[channel_A] = max(0.0, a_old - move)
+    impact[channel_B] = b_old + move
 
-    A_old = float(impact_map.get(channel_A, 0.0))
-    B_old = float(impact_map.get(channel_B, 0.0))
-    move = float(A_old * s)
-    A_new = float(A_old - move)
-    B_new = float(B_old + move)
-
-    return {
-        "type": "pathway_redistribute",
-        "channel_A": channel_A, "channel_B": channel_B,
-        "share_from_A_to_B": float(round(s, 6)),
-        "moved_pct_points": float(round(move, 6)),
-        "A_old": float(round(A_old, 6)), "A_new": float(round(A_new, 6)),
-        "B_old": float(round(B_old, 6)), "B_new": float(round(B_new, 6)),
-        "note": "Totals preserved."
-    }
-
-# ---------------------------
-# Apply update to base decomp
-# ---------------------------
-def apply_decomp_update(base_record: Dict[str, Any], df: pd.DataFrame, update: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Combine an update with the base decomp:
-      - breakout_split: replace parent channel with allocated children
-      - residual_reattribute: move fitted Base % to new channels (by shares)
-      - pathway_redistribute: move % from A to B
-    """
-    d0 = _ensure_decomp_from_record_or_recompute(base_record, df)
-    impact = dict(d0.get("impactable_pct", {}))
-    base_pct = float(d0.get("base_pct", 0.0))
-    carry_pct = float(d0.get("carryover_pct", 0.0))
-
-    t = update.get("type")
-
-    if t == "breakout_split":
-        parent = update["split_channel"]
-        alloc: Dict[str, float] = update.get("allocated", {})
-        if parent in impact:
-            del impact[parent]
-        for k, v in alloc.items():
-            impact[k] = impact.get(k, 0.0) + float(v)
-
-    elif t == "residual_reattribute":
-        alloc: Dict[str, float] = update.get("allocated", {})
-        total = float(sum(alloc.values()))
-        base_pct = max(0.0, base_pct - total)
-        for k, v in alloc.items():
-            impact[k] = impact.get(k, 0.0) + float(v)
-
-    elif t == "pathway_redistribute":
-        A = update["channel_A"]; B = update["channel_B"]
-        move = float(update.get("moved_pct_points", 0.0))
-        if A in impact:
-            impact[A] = max(0.0, float(impact[A]) - move)
-        impact[B] = impact.get(B, 0.0) + move
-
-    incr_pct = float(sum(impact.values()))
-    total_pct = base_pct + carry_pct + incr_pct
-    if incr_pct > 0 and abs(total_pct - 100.0) > 0.05:
-        scale = max(0.0, 100.0 - base_pct - carry_pct) / incr_pct
-        for k in list(impact.keys()):
-            impact[k] *= scale
-        incr_pct = float(sum(impact.values()))
-
-    # round
-    base_pct = float(round(base_pct, 6))
-    carry_pct = float(round(carry_pct, 6))
-    impact = {k: float(round(v, 6)) for k, v in impact.items()}
-    incr_pct = float(round(sum(impact.values()), 6))
-
-    return {
-        "base_pct": base_pct,
-        "carryover_pct": carry_pct,
-        "incremental_pct": incr_pct,
+    return _norm_decomp({
+        "base_pct": cur.get("base_pct", 0.0),
+        "carryover_pct": cur.get("carryover_pct", 0.0),
         "impactable_pct": impact
-    }
+    })
+
+def apply_decomp_update(base_record: Dict[str, Any], df: pd.DataFrame, new_decomp: Dict[str, Any]) -> Dict[str, Any]:
+    """Currently returns the provided new_decomp normalized. Future-safe for merging modes."""
+    return _norm_decomp(new_decomp)
