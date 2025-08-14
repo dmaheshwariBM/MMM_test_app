@@ -7,19 +7,20 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "ADVANCED_MODELS_PAGE_v2_6_0"
+PAGE_ID = "ADVANCED_MODELS_PAGE_v2_7_0"
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
-st.caption(f"Page ID: `{PAGE_ID}`")
+st.caption(f"Page ID: `{PAGE_ID}` • Persistent save message + robust writes")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Writable results roots (same logic as Results page)
+# Writable results roots (same order as Results page)
 def _abs(p: str) -> str: return os.path.abspath(p)
 CANDIDATE_RESULTS_ROOTS = [
     _abs(os.environ.get("MMM_RESULTS_DIR", "")) if os.environ.get("MMM_RESULTS_DIR") else None,
-    _abs("results"),
+    _abs(os.path.expanduser("~/.mmm_results")),
     _abs("/tmp/mmm_results"),
+    _abs("results"),
 ]
 CANDIDATE_RESULTS_ROOTS = [p for p in CANDIDATE_RESULTS_ROOTS if p]
 
@@ -37,10 +38,17 @@ def pick_writable_results_root() -> str:
     for root in CANDIDATE_RESULTS_ROOTS:
         if _ensure_dir(root):
             return root
-    fb = _abs("results_fallback"); _ensure_dir(fb); return fb
+    fb = _abs(os.path.expanduser("~/mmm_results_fallback")); _ensure_dir(fb); return fb
 
 RESULTS_ROOT = pick_writable_results_root()
-st.caption(f"Results root: `{RESULTS_ROOT}`")
+st.caption("Writable roots checked: " + ", ".join(f"`{r}`" for r in CANDIDATE_RESULTS_ROOTS))
+st.caption(f"Using results root: `{RESULTS_ROOT}`")
+
+# Persisted banner for save status across reruns
+if "last_saved_path" in st.session_state and st.session_state["last_saved_path"]:
+    st.success(f"Saved: `{st.session_state['last_saved_path']}`")
+if "last_save_error" in st.session_state and st.session_state["last_save_error"]:
+    st.error(st.session_state["last_save_error"])
 
 # ---- Import core (pure python) ----
 def _import_advanced_models():
@@ -189,21 +197,37 @@ with tab1:
             with c1:
                 name_new = st.text_input("Save as name", value=f"{base['name']}__breakout_{parent}")
                 if st.button("Save as new result"):
-                    payload = {**base, "type": "breakout_split", "decomp": new_decomp}
-                    saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
-                    st.success(f"Saved: `{saved_file}`"); st.rerun()
+                    try:
+                        payload = {**base, "type": "breakout_split", "decomp": new_decomp}
+                        saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
+                        st.session_state["last_saved_path"] = saved_file
+                        st.session_state["last_save_error"] = ""
+                        st.success(f"Saved: `{saved_file}`")
+                    except Exception as e:
+                        st.session_state["last_saved_path"] = ""
+                        st.session_state["last_save_error"] = f"Save failed: {e}"
+                        st.error(st.session_state["last_save_error"])
             with c2:
                 if st.button("Update base result"):
-                    for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
-                        try:
+                    try:
+                        updated = False
+                        for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                             with open(jf, "r") as f: rec = json.load(f)
                             if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
                                 keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = new_decomp
                                 with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
-                                st.success("Base model updated."); st.rerun()
-                        except Exception:
-                            continue
+                                st.session_state["last_saved_path"] = jf
+                                st.session_state["last_save_error"] = ""
+                                st.success(f"Updated base at: `{jf}`")
+                                updated = True
+                                break
+                        if not updated:
+                            st.warning("No matching base record found to update.")
+                    except Exception as e:
+                        st.session_state["last_saved_path"] = ""
+                        st.session_state["last_save_error"] = f"Update failed: {e}"
+                        st.error(st.session_state["last_save_error"])
         except Exception as e:
             st.error("Breakout failed."); st.exception(e)
 
@@ -233,21 +257,37 @@ with tab2:
             with c1:
                 name_new = st.text_input("Save as name", value=f"{base['name']}__residual_on_base")
                 if st.button("Save as new result", key="save_resid"):
-                    payload = {**base, "type": "residual_reattribute", "decomp": new_decomp}
-                    saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
-                    st.success(f"Saved: `{saved_file}`"); st.rerun()
+                    try:
+                        payload = {**base, "type": "residual_reattribute", "decomp": new_decomp}
+                        saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
+                        st.session_state["last_saved_path"] = saved_file
+                        st.session_state["last_save_error"] = ""
+                        st.success(f"Saved: `{saved_file}`")
+                    except Exception as e:
+                        st.session_state["last_saved_path"] = ""
+                        st.session_state["last_save_error"] = f"Save failed: {e}"
+                        st.error(st.session_state["last_save_error"])
             with c2:
                 if st.button("Update base result", key="upd_resid"):
-                    for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
-                        try:
+                    try:
+                        updated = False
+                        for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                             with open(jf, "r") as f: rec = json.load(f)
                             if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
                                 keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = new_decomp
                                 with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
-                                st.success("Base model updated."); st.rerun()
-                        except Exception:
-                            continue
+                                st.session_state["last_saved_path"] = jf
+                                st.session_state["last_save_error"] = ""
+                                st.success(f"Updated base at: `{jf}`")
+                                updated = True
+                                break
+                        if not updated:
+                            st.warning("No matching base record found to update.")
+                    except Exception as e:
+                        st.session_state["last_saved_path"] = ""
+                        st.session_state["last_save_error"] = f"Update failed: {e}"
+                        st.error(st.session_state["last_save_error"])
         except Exception as e:
             st.error("Residual re-attribution failed."); st.exception(e)
 
@@ -277,20 +317,36 @@ with tab3:
                 with c1:
                     name_new = st.text_input("Save as name", value=f"{base['name']}__pathway_{A}_to_{B}")
                     if st.button("Save as new result", key="save_path"):
-                        payload = {**base, "type": "pathway_redistribute", "decomp": new_decomp}
-                        saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
-                        st.success(f"Saved: `{saved_file}`"); st.rerun()
+                        try:
+                            payload = {**base, "type": "pathway_redistribute", "decomp": new_decomp}
+                            saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
+                            st.session_state["last_saved_path"] = saved_file
+                            st.session_state["last_save_error"] = ""
+                            st.success(f"Saved: `{saved_file}`")
+                        except Exception as e:
+                            st.session_state["last_saved_path"] = ""
+                            st.session_state["last_save_error"] = f"Save failed: {e}"
+                            st.error(st.session_state["last_save_error"])
                 with c2:
                     if st.button("Update base result", key="upd_path"):
-                        for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
-                            try:
+                        try:
+                            updated = False
+                            for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                                 with open(jf, "r") as f: rec = json.load(f)
                                 if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
                                     keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                     keep["decomp"] = new_decomp
                                     with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
-                                    st.success("Base model updated."); st.rerun()
-                            except Exception:
-                                continue
+                                    st.session_state["last_saved_path"] = jf
+                                    st.session_state["last_save_error"] = ""
+                                    st.success(f"Updated base at: `{jf}`")
+                                    updated = True
+                                    break
+                            if not updated:
+                                st.warning("No matching base record found to update.")
+                        except Exception as e:
+                            st.session_state["last_saved_path"] = ""
+                            st.session_state["last_save_error"] = f"Update failed: {e}"
+                            st.error(st.session_state["last_save_error"])
             except Exception as e:
                 st.error("Pathway redistribution failed."); st.exception(e)
