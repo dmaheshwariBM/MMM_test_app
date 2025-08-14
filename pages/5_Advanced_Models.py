@@ -19,7 +19,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ---------------------------
-# Helpers
+# Helper
 # ---------------------------
 def _load_results_catalog() -> List[Dict[str, Any]]:
     rows = []
