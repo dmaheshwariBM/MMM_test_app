@@ -87,14 +87,17 @@ def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
         return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
     return pd.Series(np.zeros(len(df)), index=df.index, name=name)
 
+# pages/6_Results.py — replace just this function
+
 def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     """
     Robustly return a decomp dict.
-    - If record['decomp'] exists and looks valid, return it.
-    - Else attempt a minimal recompute from coef/features and the dataset CSV:
-        Base% = intercept contribution share
-        Impactable% per channel = positive sum(contrib) share
-        Carryover% = 0 (fallback – requires transform metadata)
+    If record['decomp'] is missing, recompute minimal decomp from coef/features and dataset CSV.
+    Uses a safe denominator:
+      1) sum(actual target) > 0
+      2) sum(yhat) > 0
+      3) sum(all contributions) > 0
+      4) 1.0 (never 1e-12)
     """
     d = record.get("decomp")
     if isinstance(d, dict) and "impactable_pct" in d:
@@ -106,46 +109,68 @@ def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     yhat = np.asarray(record.get("yhat", []), float)
 
     if not dataset:
-        # Minimal stub
-        return {"base_pct": np.nan, "carryover_pct": np.nan, "incremental_pct": np.nan, "impactable_pct": {}}
+        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
 
     path = os.path.join(DATA_DIR, dataset)
     if not os.path.exists(path):
-        return {"base_pct": np.nan, "carryover_pct": np.nan, "incremental_pct": np.nan, "impactable_pct": {}}
+        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
 
     try:
         df = pd.read_csv(path)
     except Exception:
-        return {"base_pct": np.nan, "carryover_pct": np.nan, "incremental_pct": np.nan, "impactable_pct": {}}
+        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
 
-    # Build contribution sums
+    # Build contributions
     contrib_sum: Dict[str, float] = {}
     for f in features:
         c = float(coef.get(f, 0.0))
-        x = _to_num_series(df, f)
         if f == "const":
             s = float((c * np.ones(len(df))).sum())
         else:
-            s = float((c * x).clip(lower=0.0).sum())  # clip negatives for impact
+            if f in df.columns:
+                x = pd.to_numeric(df[f], errors="coerce").fillna(0.0)
+            elif f.endswith("__tfm") and f[:-5] in df.columns:
+                x = pd.to_numeric(df[f[:-5]], errors="coerce").fillna(0.0)
+            else:
+                x = pd.Series(np.zeros(len(df)))
+            s = float((c * x).clip(lower=0.0).sum())
         contrib_sum[f] = s
 
-    total_pred = float(np.maximum(yhat.sum(), 1e-12))
-    if total_pred <= 0:
-        total_pred = float(sum(contrib_sum.values())) or 1.0
+    # Denominator
+    total_from_y = None
+    tgt = record.get("target")
+    if tgt and tgt in df.columns:
+        total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
+    total_from_yhat = float(np.nansum(yhat)) if yhat.size > 0 else 0.0
+    total_from_contrib = float(sum(contrib_sum.values())) if contrib_sum else 0.0
+
+    candidates = [t for t in [total_from_y, total_from_yhat, total_from_contrib] if t and t > 0]
+    total_pred = candidates[0] if candidates else 1.0
 
     base_sum = float(contrib_sum.get("const", 0.0))
     base_pct = 100.0 * base_sum / total_pred
 
     impact_map: Dict[str, float] = {}
     for f, s in contrib_sum.items():
-        if f == "const": 
+        if f == "const":
             continue
         disp = f[:-5] if f.endswith("__tfm") else f
         if s > 0:
             impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
 
     carry_pct = 0.0
-    incr_pct = max(0.0, 100.0 - base_pct - carry_pct)
+    incr_pct = float(sum(impact_map.values()))
+    total_pct = base_pct + carry_pct + incr_pct
+    if abs(total_pct - 100.0) > 0.1 and incr_pct > 0:
+        scale = max(0.0, 100.0 - base_pct - carry_pct) / incr_pct
+        for k in list(impact_map.keys()):
+            impact_map[k] = impact_map[k] * scale
+        incr_pct = float(sum(impact_map.values()))
+
+    base_pct = float(round(base_pct, 6))
+    incr_pct = float(round(incr_pct, 6))
+    carry_pct = float(round(carry_pct, 6))
+    impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
 
     return {
         "base_pct": base_pct,
