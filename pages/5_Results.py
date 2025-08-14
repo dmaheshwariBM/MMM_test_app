@@ -30,7 +30,6 @@ def _load_all_results() -> List[Dict[str, Any]]:
                 # enrich
                 r["_path"] = jf
                 r["_batch"] = os.path.basename(b)
-                # parse ts if possible
                 ts = r.get("batch_ts") or os.path.basename(b)
                 try:
                     r["_ts"] = datetime.strptime(ts, "%Y%m%d_%H%M%S")
@@ -75,29 +74,85 @@ def _metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
         "p": m.get("p", None),
     }
 
-def _decomp(r: Dict[str, Any]) -> Dict[str, Any]:
-    d = r.get("decomp", {})
-    # Backward-compat guard
-    if not d or not isinstance(d, dict):
-        # Minimal decomp if missing
-        d = {
-            "base_pct": np.nan,
-            "carryover_pct": np.nan,
-            "incremental_pct": np.nan,
-            "impactable_pct": {}
-        }
-    d.setdefault("impactable_pct", {})
-    return d
-
-def _union_channels(models: List[Dict[str, Any]]) -> List[str]:
-    names = set()
-    for r in models:
-        imp = _decomp(r).get("impactable_pct", {})
-        names.update(imp.keys())
-    return sorted(names)
-
 def _to_pct(v):
     return None if v is None or (isinstance(v, float) and not np.isfinite(v)) else float(v)
+
+def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
+    """Return numeric series for a feature name; handles '__tfm' fallback to raw."""
+    if name == "const":
+        return pd.Series(np.ones(len(df)), index=df.index, name="const")
+    if name in df.columns:
+        return pd.to_numeric(df[name], errors="coerce").fillna(0.0)
+    if name.endswith("__tfm") and name[:-5] in df.columns:
+        return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
+    return pd.Series(np.zeros(len(df)), index=df.index, name=name)
+
+def _ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Robustly return a decomp dict.
+    - If record['decomp'] exists and looks valid, return it.
+    - Else attempt a minimal recompute from coef/features and the dataset CSV:
+        Base% = intercept contribution share
+        Impactable% per channel = positive sum(contrib) share
+        Carryover% = 0 (fallback – requires transform metadata)
+    """
+    d = record.get("decomp")
+    if isinstance(d, dict) and "impactable_pct" in d:
+        return d
+
+    dataset = record.get("dataset")
+    features = record.get("features", []) or []
+    coef = record.get("coef", {}) or {}
+    yhat = np.asarray(record.get("yhat", []), float)
+
+    if not dataset:
+        # Minimal stub
+        return {"base_pct": np.nan, "carryover_pct": np.nan, "incremental_pct": np.nan, "impactable_pct": {}}
+
+    path = os.path.join(DATA_DIR, dataset)
+    if not os.path.exists(path):
+        return {"base_pct": np.nan, "carryover_pct": np.nan, "incremental_pct": np.nan, "impactable_pct": {}}
+
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {"base_pct": np.nan, "carryover_pct": np.nan, "incremental_pct": np.nan, "impactable_pct": {}}
+
+    # Build contribution sums
+    contrib_sum: Dict[str, float] = {}
+    for f in features:
+        c = float(coef.get(f, 0.0))
+        x = _to_num_series(df, f)
+        if f == "const":
+            s = float((c * np.ones(len(df))).sum())
+        else:
+            s = float((c * x).clip(lower=0.0).sum())  # clip negatives for impact
+        contrib_sum[f] = s
+
+    total_pred = float(np.maximum(yhat.sum(), 1e-12))
+    if total_pred <= 0:
+        total_pred = float(sum(contrib_sum.values())) or 1.0
+
+    base_sum = float(contrib_sum.get("const", 0.0))
+    base_pct = 100.0 * base_sum / total_pred
+
+    impact_map: Dict[str, float] = {}
+    for f, s in contrib_sum.items():
+        if f == "const": 
+            continue
+        disp = f[:-5] if f.endswith("__tfm") else f
+        if s > 0:
+            impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
+
+    carry_pct = 0.0
+    incr_pct = max(0.0, 100.0 - base_pct - carry_pct)
+
+    return {
+        "base_pct": base_pct,
+        "carryover_pct": carry_pct,
+        "incremental_pct": incr_pct,
+        "impactable_pct": impact_map
+    }
 
 # ---------------------------
 # Load catalog
@@ -154,8 +209,10 @@ st.dataframe(met_df, use_container_width=True)
 # ---------------------------
 st.subheader("Decomposition summary")
 decomp_rows = []
+decomp_map = {}
 for lbl, r in zip(chosen, models):
-    d = _decomp(r)
+    d = _ensure_decomp(r)
+    decomp_map[lbl] = d
     decomp_rows.append({
         "Model": lbl,
         "Base %": _to_pct(d.get("base_pct")),
@@ -173,6 +230,14 @@ st.bar_chart(decomp_df)
 # ---------------------------
 st.subheader("Impactable % by channel — aligned across models")
 
+def _union_channels(models: List[Dict[str, Any]]) -> List[str]:
+    names = set()
+    for r in models:
+        d = _ensure_decomp(r)
+        imp = d.get("impactable_pct", {}) or {}
+        names.update(imp.keys())
+    return sorted(names)
+
 channels = _union_channels(models)
 if not channels:
     st.info("No per-channel impactable breakdown available in selected models.")
@@ -182,7 +247,7 @@ else:
     for ch in channels:
         row = {"Channel": ch}
         for lbl, r in zip(chosen, models):
-            imp = _decomp(r).get("impactable_pct", {})
+            imp = (decomp_map.get(lbl) or {}).get("impactable_pct", {}) or _ensure_decomp(r).get("impactable_pct", {})
             row[lbl] = _to_pct(imp.get(ch, 0.0))
         mat.append(row)
     impact_df = pd.DataFrame(mat).set_index("Channel")
@@ -192,7 +257,7 @@ else:
 
     st.dataframe(impact_df, use_container_width=True)
 
-    # Per-channel chart vs baseline (first selected by default)
+    # Per-channel chart vs baseline
     st.markdown("**Δ vs baseline (selected above)**")
     base_col = baseline
     if base_col in impact_df.columns:
@@ -214,7 +279,6 @@ export_parts.append(("decomposition", decomp_wide))
 if 'impact_df' in locals():
     export_parts.append(("impactable_by_channel", impact_df.reset_index()))
 
-# Build a single CSV text
 from io import StringIO
 csv_buf = StringIO()
 for name, dfp in export_parts:
@@ -232,16 +296,16 @@ st.caption("Choose any models here; they’ll be available on the Budget page as
 to_budget = st.multiselect("Models to send", options=chosen, default=chosen[: min(3, len(chosen))])
 if st.button("Send to Budget Optimization"):
     selected_records = [models[chosen.index(lbl)] for lbl in to_budget]
-    # Keep only the light bits (avoid huge objects)
     skinny = []
     for r in selected_records:
+        d = _ensure_decomp(r)
         skinny.append({
             "name": r.get("name"),
             "type": r.get("type"),
             "dataset": r.get("dataset"),
             "target": r.get("target"),
             "metrics": r.get("metrics", {}),
-            "decomp": r.get("decomp", {}),
+            "decomp": d,
             "features": r.get("features", []),
             "_path": r.get("_path", ""),
             "_ts": r.get("_ts").strftime("%Y-%m-%d %H:%M:%S") if r.get("_ts") else "",
