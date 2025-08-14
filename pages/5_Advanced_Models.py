@@ -7,14 +7,40 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "ADVANCED_MODELS_PAGE_v2_5_0"
+PAGE_ID = "ADVANCED_MODELS_PAGE_v2_6_0"
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
 st.caption(f"Page ID: `{PAGE_ID}`")
 
 DATA_DIR = "data"
-RESULTS_DIR = "results"
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# Writable results roots (same logic as Results page)
+def _abs(p: str) -> str: return os.path.abspath(p)
+CANDIDATE_RESULTS_ROOTS = [
+    _abs(os.environ.get("MMM_RESULTS_DIR", "")) if os.environ.get("MMM_RESULTS_DIR") else None,
+    _abs("results"),
+    _abs("/tmp/mmm_results"),
+]
+CANDIDATE_RESULTS_ROOTS = [p for p in CANDIDATE_RESULTS_ROOTS if p]
+
+def _ensure_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        testf = os.path.join(path, ".write_test")
+        with open(testf, "w") as f: f.write("ok")
+        os.remove(testf)
+        return True
+    except Exception:
+        return False
+
+def pick_writable_results_root() -> str:
+    for root in CANDIDATE_RESULTS_ROOTS:
+        if _ensure_dir(root):
+            return root
+    fb = _abs("results_fallback"); _ensure_dir(fb); return fb
+
+RESULTS_ROOT = pick_writable_results_root()
+st.caption(f"Results root: `{RESULTS_ROOT}`")
 
 # ---- Import core (pure python) ----
 def _import_advanced_models():
@@ -35,90 +61,67 @@ def _import_advanced_models():
 am = _import_advanced_models()
 st.caption(f"Loaded advanced_models from: `{getattr(am, '__file__', 'unknown')}` (core v {getattr(am, 'ADV_MODELS_VERSION', 'unknown')})")
 
-REQUIRED_FUNCS = [
-    "breakout_split",
-    "residual_reattribute",
-    "pathway_redistribute",
-    "apply_decomp_update",
-    "_ensure_decomp_from_record_or_recompute",
-]
+REQUIRED_FUNCS = ["breakout_split","residual_reattribute","pathway_redistribute","apply_decomp_update","_ensure_decomp_from_record_or_recompute"]
 missing = [fn for fn in REQUIRED_FUNCS if not hasattr(am, fn)]
 if missing:
     st.error(f"`advanced_models` missing: {', '.join(missing)}"); st.stop()
 
-# ───────── JSON-safe save helpers (same as Results page) ─────────
+# ───────── JSON-safe save helpers ─────────
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
 
 def _json_ready(obj: Any):
     import numpy as _np
     from datetime import datetime as _dt
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    if isinstance(obj, _dt):
-        return obj.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(obj, (list, tuple)):
-        return [_json_ready(x) for x in obj]
+    if obj is None or isinstance(obj, (bool, int, float, str)): return obj
+    if isinstance(obj, _dt): return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, (list, tuple)): return [_json_ready(x) for x in obj]
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            if k in ("_ts", "_path"):
-                continue
+            if k in ("_ts","_path"): continue
             out[str(k)] = _json_ready(v)
         return out
     if hasattr(obj, "tolist"):
-        try:
-            return obj.tolist()
-        except Exception:
-            pass
+        try: return obj.tolist()
+        except Exception: pass
     try:
-        if isinstance(obj, (_np.floating, _np.integer)):
-            return obj.item()
-    except Exception:
-        pass
-    try:
-        return float(obj)
-    except Exception:
-        return str(obj)
+        if isinstance(obj, (_np.floating, _np.integer)): return obj.item()
+    except Exception: pass
+    try: return float(obj)
+    except Exception: return str(obj)
 
-def save_result_json(results_dir: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
+def save_result_json(results_root: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
     batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(results_dir, batch_ts)
+    out_dir = os.path.join(results_root, batch_ts)
     os.makedirs(out_dir, exist_ok=True)
     fname = f"{batch_ts}__{_safe(name)}__{_safe(target)}.json"
-    body = {
-        "batch_ts": batch_ts,
-        "name": name,
-        "target": target,
-        "dataset": dataset,
-        **payload
-    }
+    body = {"batch_ts": batch_ts, "name": name, "target": target, "dataset": dataset, **payload}
     body = _json_ready(body)
-    with open(os.path.join(out_dir, fname), "w") as f:
+    full_path = os.path.join(out_dir, fname)
+    with open(full_path, "w") as f:
         json.dump(body, f, indent=2)
-    return out_dir
+    return full_path
 
 # ---------------------------
 # Helpers
 # ---------------------------
 def _load_results_catalog() -> List[Dict[str, Any]]:
     rows = []
-    batches = sorted(glob.glob(os.path.join(RESULTS_DIR, "*")), reverse=True)
-    for b in batches:
-        for jf in sorted(glob.glob(os.path.join(b, "*.json")), reverse=True):
-            try:
-                with open(jf, "r") as f:
-                    r = json.load(f)
-                r["_path"] = jf
-                r["_batch"] = os.path.basename(b)
-                ts = r.get("batch_ts") or os.path.basename(b)
-                try:
-                    r["_ts"] = datetime.strptime(ts, "%Y%m%d_%H%M%S")
-                except Exception:
-                    r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
-                rows.append(r)
-            except Exception:
-                continue
+    files = sorted(glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True), reverse=True)
+    for jf in files:
+        try:
+            with open(jf, "r") as f: r = json.load(f)
+            r["_path"] = jf
+            ts = r.get("batch_ts")
+            if ts:
+                try: r["_ts"] = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+                except Exception: r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
+            else:
+                r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
+            rows.append(r)
+        except Exception:
+            continue
     rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
     return rows
 
@@ -187,20 +190,17 @@ with tab1:
                 name_new = st.text_input("Save as name", value=f"{base['name']}__breakout_{parent}")
                 if st.button("Save as new result"):
                     payload = {**base, "type": "breakout_split", "decomp": new_decomp}
-                    out_dir = save_result_json(RESULTS_DIR, name_new, base.get("target","?"), base["dataset"], payload)
-                    st.success(f"Saved to `{out_dir}`"); st.rerun()
+                    saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
+                    st.success(f"Saved: `{saved_file}`"); st.rerun()
             with c2:
                 if st.button("Update base result"):
-                    # overwrite only the decomp of the base record
-                    for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
+                    for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                         try:
-                            with open(jf, "r") as f:
-                                rec = json.load(f)
+                            with open(jf, "r") as f: rec = json.load(f)
                             if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
                                 keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = new_decomp
-                                with open(jf, "w") as g:
-                                    json.dump(_json_ready(keep), g, indent=2)
+                                with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
                                 st.success("Base model updated."); st.rerun()
                         except Exception:
                             continue
@@ -226,9 +226,7 @@ with tab2:
                 "Base % after": out["base_pct_after"],
                 "Fitted Base share (%)": out["fitted_share_of_base"] * 100.0
             }]))
-            st.dataframe(pd.DataFrame({"Channel": list(out["allocated"].keys()),
-                                       "Allocated (pp)": list(out["allocated"].values())}),
-                         use_container_width=True)
+            st.dataframe(pd.DataFrame({"Channel": list(out["allocated"].keys()), "Allocated (pp)": list(out["allocated"].values())}), use_container_width=True)
             _render_decomp(new_decomp)
 
             c1, c2 = st.columns(2)
@@ -236,19 +234,17 @@ with tab2:
                 name_new = st.text_input("Save as name", value=f"{base['name']}__residual_on_base")
                 if st.button("Save as new result", key="save_resid"):
                     payload = {**base, "type": "residual_reattribute", "decomp": new_decomp}
-                    out_dir = save_result_json(RESULTS_DIR, name_new, base.get("target","?"), base["dataset"], payload)
-                    st.success(f"Saved to `{out_dir}`"); st.rerun()
+                    saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
+                    st.success(f"Saved: `{saved_file}`"); st.rerun()
             with c2:
                 if st.button("Update base result", key="upd_resid"):
-                    for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
+                    for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                         try:
-                            with open(jf, "r") as f:
-                                rec = json.load(f)
+                            with open(jf, "r") as f: rec = json.load(f)
                             if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
                                 keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = new_decomp
-                                with open(jf, "w") as g:
-                                    json.dump(_json_ready(keep), g, indent=2)
+                                with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
                                 st.success("Base model updated."); st.rerun()
                         except Exception:
                             continue
@@ -282,19 +278,17 @@ with tab3:
                     name_new = st.text_input("Save as name", value=f"{base['name']}__pathway_{A}_to_{B}")
                     if st.button("Save as new result", key="save_path"):
                         payload = {**base, "type": "pathway_redistribute", "decomp": new_decomp}
-                        out_dir = save_result_json(RESULTS_DIR, name_new, base.get("target","?"), base["dataset"], payload)
-                        st.success(f"Saved to `{out_dir}`"); st.rerun()
+                        saved_file = save_result_json(RESULTS_ROOT, name_new, base.get("target","?"), base["dataset"], payload)
+                        st.success(f"Saved: `{saved_file}`"); st.rerun()
                 with c2:
                     if st.button("Update base result", key="upd_path"):
-                        for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
+                        for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                             try:
-                                with open(jf, "r") as f:
-                                    rec = json.load(f)
+                                with open(jf, "r") as f: rec = json.load(f)
                                 if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
                                     keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                     keep["decomp"] = new_decomp
-                                    with open(jf, "w") as g:
-                                        json.dump(_json_ready(keep), g, indent=2)
+                                    with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
                                     st.success("Base model updated."); st.rerun()
                             except Exception:
                                 continue
