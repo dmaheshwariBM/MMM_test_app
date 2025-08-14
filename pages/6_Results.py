@@ -1,12 +1,10 @@
 # pages/6_Results.py
-# v1.9.2  ASCII-only, syntax-safe, persistent saved-path banner, robust save/load
+# v2.0.0  ASCII-only. Compare and Inspect saved runs. Robust loader and exports.
 
 import os
 import re
 import glob
 import json
-import pathlib
-import importlib
 from io import StringIO
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -15,14 +13,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_9_2"
+PAGE_ID = "RESULTS_PAGE_v2_0_0"
 st.title("Results")
 st.caption("Page ID: {}".format(PAGE_ID))
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ---------------- Writable roots (ASCII-only) ----------------
+# -------- Writable roots --------
 def _abs(p: str) -> str:
     return os.path.abspath(p)
 
@@ -54,78 +52,18 @@ def pick_writable_results_root() -> str:
     return fb
 
 RESULTS_ROOT = pick_writable_results_root()
+st.caption("Scanning results under: {}".format(", ".join(CANDIDATE_RESULTS_ROOTS)))
+st.caption("Using results root: {}".format(RESULTS_ROOT))
 
-# Persisted banners (survive reruns)
+# Persisted banners
 if "last_saved_path" in st.session_state and st.session_state["last_saved_path"]:
     st.success("Saved: {}".format(st.session_state["last_saved_path"]))
 if "last_save_error" in st.session_state and st.session_state["last_save_error"]:
     st.error(st.session_state["last_save_error"])
 
-st.caption("Writable roots checked: {}".format(", ".join(["{}".format(r) for r in CANDIDATE_RESULTS_ROOTS])))
-st.caption("Using results root: {}".format(RESULTS_ROOT))
-
-# ---------------- Utilities ----------------
+# -------- Utilities --------
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:72]
-
-def _intercept_key(coef: Dict[str, float]) -> Optional[str]:
-    for k in ("const", "Intercept", "intercept", "CONST", "const_", "_const", "beta0", "b0"):
-        if k in coef:
-            return k
-    return None
-
-def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
-    if name == "const":
-        return pd.Series(np.ones(len(df)), index=df.index, name="const")
-    if name in df.columns:
-        return pd.to_numeric(df[name], errors="coerce").fillna(0.0)
-    if name.endswith("__tfm") and name[:-5] in df.columns:
-        return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
-    return pd.Series(np.zeros(len(df)), index=df.index, name=name)
-
-def _json_ready(obj: Any):
-    import numpy as _np
-    from datetime import datetime as _dt
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    if isinstance(obj, _dt):
-        return obj.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(obj, (list, tuple)):
-        return [_json_ready(x) for x in obj]
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            if k in ("_ts", "_path"):
-                continue
-            out[str(k)] = _json_ready(v)
-        return out
-    if hasattr(obj, "tolist"):
-        try:
-            return obj.tolist()
-        except Exception:
-            pass
-    try:
-        if isinstance(obj, (_np.floating, _np.integer)):
-            return obj.item()
-    except Exception:
-        pass
-    try:
-        return float(obj)
-    except Exception:
-        return str(obj)
-
-def save_result_json(results_root: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
-    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(results_root, batch_ts)
-    os.makedirs(out_dir, exist_ok=True)
-    fname = "{}__{}__{}.json".format(batch_ts, _safe(name), _safe(target))
-    body = {"batch_ts": batch_ts, "name": name, "target": target, "dataset": dataset}
-    body.update(payload)
-    body = _json_ready(body)
-    full_path = os.path.join(out_dir, fname)
-    with open(full_path, "w", encoding="utf-8") as f:
-        json.dump(body, f, indent=2)
-    return full_path
 
 def load_results_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -155,11 +93,74 @@ def load_results_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
     rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
     return rows
 
-def normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
-    base_pct = float(d.get("base_pct", 0.0))
-    carry_pct = float(d.get("carryover_pct", 0.0))
-    impact_map = dict(d.get("impactable_pct", {}))
+def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
+    d = record.get("decomp")
+    if isinstance(d, dict) and "impactable_pct" in d:
+        # normalize/round
+        base_pct = float(d.get("base_pct", 0.0))
+        carry_pct = float(d.get("carryover_pct", 0.0))
+        impact = dict(d.get("impactable_pct", {}))
+        incr = float(sum(impact.values()))
+        total = base_pct + carry_pct + incr
+        if incr > 0 and abs(total - 100.0) > 0.05:
+            target_incr = max(0.0, 100.0 - base_pct - carry_pct)
+            scale = target_incr / incr if incr > 0 else 1.0
+            for k in list(impact.keys()):
+                impact[k] = float(impact[k]) * scale
+            incr = float(sum(impact.values()))
+        return {
+            "base_pct": float(round(base_pct, 6)),
+            "carryover_pct": float(round(carry_pct, 6)),
+            "incremental_pct": float(round(incr, 6)),
+            "impactable_pct": {k: float(round(v, 6)) for k, v in impact.items()},
+        }
+
+    # fallback: recompute from coef and features if dataset available
+    features = record.get("features", []) or []
+    coef = record.get("coef", {}) or {}
+    dataset = record.get("dataset")
+    yhat = record.get("yhat", [])
+    if not dataset:
+        return {"base_pct": float("nan"), "carryover_pct": 0.0, "incremental_pct": float("nan"), "impactable_pct": {}}
+    path = os.path.join(DATA_DIR, dataset)
+    if not os.path.exists(path):
+        return {"base_pct": float("nan"), "carryover_pct": 0.0, "incremental_pct": float("nan"), "impactable_pct": {}}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {"base_pct": float("nan"), "carryover_pct": 0.0, "incremental_pct": float("nan"), "impactable_pct": {}}
+
+    # compute contributions
+    n = len(df)
+    contrib_sum: Dict[str, float] = {}
+    if "const" in coef:
+        contrib_sum["const"] = float(coef.get("const", 0.0)) * n
+    for f in features:
+        c = float(coef.get(f, 0.0))
+        x = pd.to_numeric(df[f], errors="coerce").fillna(0.0) if f in df.columns else pd.Series([0.0] * n)
+        s = float(np.sum(np.maximum(c * x.values, 0.0)))
+        contrib_sum[f] = s
+
+    tgt = record.get("target")
+    total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum()) if (tgt and tgt in df.columns) else 0.0
+    total_from_yhat = float(np.nansum(np.asarray(yhat, float))) if yhat else 0.0
+    total_from_contrib = float(sum(contrib_sum.values())) if contrib_sum else 0.0
+    candidates = [t for t in (total_from_y, total_from_yhat, total_from_contrib) if t and t > 0]
+    denom = candidates[0] if candidates else 1.0
+
+    base_sum = float(contrib_sum.get("const", 0.0))
+    base_pct = 100.0 * base_sum / denom
+
+    impact_map: Dict[str, float] = {}
+    for f, s in contrib_sum.items():
+        if f == "const":
+            continue
+        disp = f[:-5] if f.endswith("__tfm") else f
+        if s > 0:
+            impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / denom
+
     incr_pct = float(sum(impact_map.values()))
+    carry_pct = 0.0
     total = base_pct + carry_pct + incr_pct
     if incr_pct > 0 and abs(total - 100.0) > 0.05:
         target_incr = max(0.0, 100.0 - base_pct - carry_pct)
@@ -167,134 +168,49 @@ def normalize_and_round(d: Dict[str, Any]) -> Dict[str, Any]:
         for k in list(impact_map.keys()):
             impact_map[k] = impact_map[k] * scale
         incr_pct = float(sum(impact_map.values()))
-    base_pct = float(round(base_pct, 6))
-    carry_pct = float(round(carry_pct, 6))
-    impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
-    incr_pct = float(round(sum(impact_map.values()), 6))
-    return {"base_pct": base_pct, "carryover_pct": carry_pct, "incremental_pct": incr_pct, "impactable_pct": impact_map}
 
-def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
-    d = record.get("decomp")
-    if isinstance(d, dict) and "impactable_pct" in d:
-        return normalize_and_round(d)
-    dataset = record.get("dataset")
-    features = record.get("features", []) or []
-    coef = record.get("coef", {}) or {}
-    yhat = np.asarray(record.get("yhat", []), float)
-    if not dataset:
-        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
-    path = os.path.join(DATA_DIR, dataset)
-    if not os.path.exists(path):
-        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
-    contrib_sum: Dict[str, float] = {}
-    n = len(df)
-    ik = _intercept_key(coef)
-    if ik is not None:
-        contrib_sum["const"] = float(coef.get(ik, 0.0)) * n
-    for f in features:
-        if f == "const":
-            continue
-        c = float(coef.get(f, 0.0))
-        x = _to_num_series(df, f)
-        contrib_sum[f] = float((c * x).clip(lower=0.0).sum())
-    total_from_y = None
-    tgt = record.get("target")
-    if tgt and tgt in df.columns:
-        total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
-    total_from_yhat = float(np.nansum(yhat)) if yhat.size > 0 else 0.0
-    total_from_contrib = float(sum(contrib_sum.values())) if contrib_sum else 0.0
-    candidates = [t for t in (total_from_y, total_from_yhat, total_from_contrib) if t and t > 0]
-    total_pred = candidates[0] if candidates else 1.0
-    base_sum = float(contrib_sum.get("const", 0.0))
-    base_pct = 100.0 * base_sum / total_pred
-    impact_map: Dict[str, float] = {}
-    for f, s in contrib_sum.items():
-        if f == "const":
-            continue
-        disp = f[:-5] if f.endswith("__tfm") else f
-        if s > 0:
-            impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
-    return normalize_and_round({
-        "base_pct": base_pct,
-        "carryover_pct": 0.0,
-        "incremental_pct": float(sum(impact_map.values())),
-        "impactable_pct": impact_map
-    })
+    return {
+        "base_pct": float(round(base_pct, 6)),
+        "carryover_pct": float(round(carry_pct, 6)),
+        "incremental_pct": float(round(incr_pct, 6)),
+        "impactable_pct": {k: float(round(v, 6)) for k, v in impact_map.items()},
+    }
 
 def metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
     m = r.get("metrics", {}) or {}
-    return {"R2": m.get("r2"), "Adj R2": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
-
-def _short_type(t: str) -> str:
-    mapping = {
-        "base": "base",
-        "breakout_split": "breakout",
-        "residual_reattribute": "residual",
-        "pathway_redistribute": "pathway",
-        "composite": "composite",
-    }
-    return mapping.get(str(t), str(t) or "base")
+    return {"R2": m.get("r2"), "AdjR2": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
 
 def fmt_label(r: Dict[str, Any]) -> str:
     nm = r.get("name", "(unnamed)")
-    tp = _short_type(r.get("type", "base"))
+    tp = r.get("type", "base")
     tgt = r.get("target", "?")
     ts = r.get("_ts")
     when = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
     return "{} | {} | {} | {}".format(nm, tp, tgt, when)
 
-def _load_csv(name: str) -> pd.DataFrame:
-    return pd.read_csv(os.path.join(DATA_DIR, name))
-
-# ---------------- Import advanced core (optional) ----------------
-def _import_advanced_models():
-    try:
-        from core import advanced_models as am  # type: ignore
-        return am
-    except Exception:
-        pass
-    core_path = pathlib.Path("core/advanced_models.py").resolve()
-    if not core_path.exists():
-        return None
-    spec = importlib.util.spec_from_file_location("advanced_models_local", core_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)  # type: ignore
-    return module
-
-am = _import_advanced_models()
-if am is None:
-    st.caption("Advanced core not found (core/advanced_models.py). Compose tab will still show, but operations require the core file.")
-else:
-    st.caption("Advanced core: {} (v {})".format(getattr(am, "__file__", "unknown"), getattr(am, "ADV_MODELS_VERSION", "?")))
-
-# ---------------- Top actions ----------------
+# -------- Top actions --------
 c1, c2, c3 = st.columns([1, 2, 3])
 with c1:
     if st.button("Refresh list"):
         st.rerun()
 with c2:
-    show_diag = st.toggle("Diagnostics", value=False)
+    show_diag = st.checkbox("Diagnostics", value=False)
 with c3:
-    st.caption("Scanning roots: {}".format(", ".join(["{}".format(r) for r in CANDIDATE_RESULTS_ROOTS])))
+    st.caption("Roots: {}".format(", ".join(CANDIDATE_RESULTS_ROOTS)))
 
-# ---------------- Load catalog ----------------
+# -------- Load catalog --------
 catalog = load_results_catalog(CANDIDATE_RESULTS_ROOTS)
 if show_diag:
     st.info("Found {} saved JSON file(s).".format(len(catalog)))
-    for r in catalog[:25]:
+    for r in catalog[:20]:
         st.text(" - {}".format(r.get("_path")))
 
 if not catalog:
-    st.info("No saved models yet. Build and save a model, then reload this page.")
+    st.info("No saved models yet. Go to Modeling, save a run, then refresh here.")
     st.stop()
 
-# ---------------- Tabs ----------------
-tab_cmp, tab_inspect, tab_compose = st.tabs(["Compare", "Inspect", "Compose"])
+# -------- Tabs --------
+tab_cmp, tab_inspect = st.tabs(["Compare", "Inspect"])
 
 # ===== Compare =====
 with tab_cmp:
@@ -362,6 +278,27 @@ with tab_cmp:
         csv_bytes = csv_buf.getvalue().encode("utf-8")
         st.download_button("Download comparison CSV", data=csv_bytes, file_name="mmm_results_comparison.csv", mime="text/csv")
 
+        st.subheader("Send to Budget Optimization")
+        to_budget = st.multiselect("Models to send", options=chosen, default=chosen[:min(3, len(chosen))])
+        if st.button("Send"):
+            skinny = []
+            for lbl in to_budget:
+                r = models[chosen.index(lbl)]
+                d = decomp_map[lbl]
+                skinny.append({
+                    "name": r.get("name"),
+                    "type": r.get("type"),
+                    "dataset": r.get("dataset"),
+                    "target": r.get("target"),
+                    "metrics": r.get("metrics", {}),
+                    "decomp": d,
+                    "features": r.get("features", []),
+                    "_path": r.get("_path", ""),
+                    "_ts": r.get("_ts").strftime("%Y-%m-%d %H:%M:%S") if r.get("_ts") else "",
+                })
+            st.session_state["budget_candidates"] = skinny
+            st.success("Sent {} model(s) to Budget Optimization.".format(len(skinny)))
+
 # ===== Inspect =====
 with tab_inspect:
     st.subheader("Pick a saved run")
@@ -369,7 +306,7 @@ with tab_inspect:
     i = st.selectbox("Saved model", options=list(range(len(labels))), format_func=lambda k: labels[k], index=0)
     r = catalog[i]
     st.write("Name: {} | Type: {} | Target: {} | Saved: {}".format(
-        r.get("name"), _short_type(r.get("type", "base")), r.get("target"), r.get("_ts")))
+        r.get("name"), r.get("type","base"), r.get("target"), r.get("_ts")))
     d = ensure_decomp(r)
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Base %", "{:.2f}%".format(d["base_pct"]))
@@ -381,195 +318,5 @@ with tab_inspect:
         st.bar_chart(dfv)
         st.dataframe(dfv, use_container_width=True)
 
-# ===== Compose (optional; needs core/advanced_models.py) =====
-with tab_compose:
-    def _import_advanced_models_again():
-        try:
-            from core import advanced_models as am2  # type: ignore
-            return am2
-        except Exception:
-            pass
-        core_path = pathlib.Path("core/advanced_models.py").resolve()
-        if not core_path.exists():
-            return None
-        spec = importlib.util.spec_from_file_location("advanced_models_local", core_path)
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)  # type: ignore
-        return module
-
-    am2 = _import_advanced_models_again()
-    if am2 is None:
-        st.warning("Install core/advanced_models.py to use Compose.")
-        st.stop()
-
-    labels = [fmt_label(r) for r in catalog]
-    k = st.selectbox("Base model", options=list(range(len(labels))), format_func=lambda idx: labels[idx], index=0)
-    base = catalog[k]
-    st.caption("Dataset: {} | Target: {}".format(base.get("dataset", "?"), base.get("target", "?")))
-
-    ops_key = "compose_ops"
-    if ops_key not in st.session_state:
-        st.session_state[ops_key] = []
-
-    try:
-        df_base = _load_csv(base["dataset"])
-    except Exception as e:
-        st.error("Could not open dataset: {}".format(base.get("dataset"))); st.exception(e); st.stop()
-
-    # Require these functions in core
-    required = ["breakout_split", "residual_reattribute", "pathway_redistribute", "apply_decomp_update", "_ensure_decomp_from_record_or_recompute"]
-    missing = [fn for fn in required if not hasattr(am2, fn)]
-    if missing:
-        st.error("advanced_models missing: {}".format(", ".join(missing)))
-        st.stop()
-
-    d0 = am2._ensure_decomp_from_record_or_recompute(base, df_base)
-    features = [f for f in base.get("features", []) if f != "const"]
-    features_disp = [f[:-5] if f.endswith("__tfm") else f for f in features]
-    base_set = set(features_disp)
-    numeric_cols = [c for c in df_base.columns if pd.api.types.is_numeric_dtype(df_base[c])]
-    not_in_base = [c for c in numeric_cols if (c not in base_set and not c.startswith("_tfm_"))]
-
-    cB, cR, cP = st.columns(3)
-    with cB:
-        st.write("Breakout split")
-        parent = st.selectbox("Parent channel", options=features_disp, key="co_parent")
-        subs = st.multiselect("Sub-metrics", options=not_in_base, key="co_subs")
-        if st.button("Add Breakout"):
-            st.session_state[ops_key].append({"type": "breakout_split", "parent": parent, "subs": subs})
-    with cR:
-        st.write("Residual on Base")
-        extras = st.multiselect("Explain Base with", options=not_in_base, key="co_extras")
-        frac = st.slider("Fraction of fitted Base", 0.1, 1.0, 1.0, 0.1, key="co_frac")
-        if st.button("Add Residual"):
-            st.session_state[ops_key].append({"type": "residual_reattribute", "extras": extras, "fraction": float(frac)})
-    with cP:
-        st.write("Pathway")
-        A = st.selectbox("From (A)", options=features_disp, key="co_A")
-        B = st.selectbox("To (B)", options=[c for c in features_disp if c != A], key="co_B")
-        if st.button("Add Pathway"):
-            st.session_state[ops_key].append({"type": "pathway_redistribute", "A": A, "B": B})
-
-    st.divider()
-    st.markdown("Pipeline")
-    if not st.session_state[ops_key]:
-        st.info("No operations yet.")
-    else:
-        pretty = []
-        for idx, op in enumerate(st.session_state[ops_key], 1):
-            if op["type"] == "breakout_split":
-                pretty.append({"#": idx, "Type": "breakout", "Parent": op["parent"], "Sub-metrics": ", ".join(op["subs"])})
-            elif op["type"] == "residual_reattribute":
-                pretty.append({"#": idx, "Type": "residual", "Extras": ", ".join(op["extras"]), "Fraction": op["fraction"]})
-            else:
-                pretty.append({"#": idx, "Type": "pathway", "A_to_B": "{}->{}".format(op["A"], op["B"])})
-        st.dataframe(pd.DataFrame(pretty), use_container_width=True)
-
-        c1_, c2_, c3_ = st.columns(3)
-        with c1_:
-            if st.button("Clear all"):
-                st.session_state[ops_key] = []
-                st.rerun()
-        with c2_:
-            rm_idx = st.number_input("Remove step number", min_value=1, max_value=len(st.session_state[ops_key]), value=1, step=1)
-        with c3_:
-            if st.button("Remove step"):
-                st.session_state[ops_key].pop(int(rm_idx) - 1)
-                st.rerun()
-
-    st.divider()
-    if st.button("Preview composed result"):
-        try:
-            rec = dict(base)
-            current_decomp = am2._ensure_decomp_from_record_or_recompute(rec, df_base)
-            rec["decomp"] = current_decomp
-
-            for op in st.session_state[ops_key]:
-                if op["type"] == "breakout_split":
-                    out = am2.breakout_split(df=df_base, base_record=rec, channel_to_split=op["parent"], sub_metrics=op["subs"])
-                elif op["type"] == "residual_reattribute":
-                    out = am2.residual_reattribute(df=df_base, base_record=rec, extra_channels=op["extras"], fraction=float(op["fraction"]))
-                else:
-                    out = am2.pathway_redistribute(df=df_base, base_record=rec, channel_A=op["A"], channel_B=op["B"])
-                current_decomp = am2.apply_decomp_update(rec, df_base, out)
-                rec["decomp"] = current_decomp
-
-            st.success("Preview ready")
-            d = current_decomp
-            c1x, c2x, c3x = st.columns(3)
-            with c1x: st.metric("Base %", "{:.2f}%".format(d["base_pct"]))
-            with c2x: st.metric("Carryover %", "{:.2f}%".format(d["carryover_pct"]))
-            with c3x: st.metric("Incremental %", "{:.2f}%".format(d["incremental_pct"]))
-            imp = d.get("impactable_pct", {})
-            if imp:
-                dfv = pd.DataFrame({"Channel": list(imp.keys()), "Impactable %": list(imp.values())}).set_index("Channel")
-                st.bar_chart(dfv)
-                st.dataframe(dfv, use_container_width=True)
-
-            st.markdown("Save / Send")
-            cL, cM, cR = st.columns(3)
-            with cL:
-                nm = st.text_input("Save as name", value="{}__composite".format(base.get("name", "base")), key="compose_name")
-                if st.button("Save as new result", key="compose_save"):
-                    try:
-                        payload = {
-                            "type": "composite",
-                            "pipeline": st.session_state[ops_key],
-                            "decomp": current_decomp,
-                            "metrics": base.get("metrics", {}),
-                            "coef": base.get("coef", {}),
-                            "yhat": base.get("yhat", []),
-                            "features": base.get("features", []),
-                        }
-                        saved_file = save_result_json(RESULTS_ROOT, nm, base.get("target", "?"), base.get("dataset", "?"), payload)
-                        st.session_state["last_saved_path"] = saved_file
-                        st.session_state["last_save_error"] = ""
-                        st.success("Saved: {}".format(saved_file))
-                    except Exception as e:
-                        st.session_state["last_saved_path"] = ""
-                        st.session_state["last_save_error"] = "Save failed: {}".format(e)
-                        st.error(st.session_state["last_save_error"])
-            with cM:
-                if st.button("Send preview to Budget Optimization"):
-                    preview_skinny = [{
-                        "name": "{}__composite_preview".format(base.get("name", "base")),
-                        "type": "composite",
-                        "dataset": base.get("dataset"),
-                        "target": base.get("target"),
-                        "metrics": base.get("metrics", {}),
-                        "decomp": current_decomp,
-                        "features": base.get("features", []),
-                        "_path": "(preview)",
-                        "_ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }]
-                    st.session_state["budget_candidates"] = preview_skinny
-                    st.success("Preview sent to Budget Optimization.")
-            with cR:
-                if st.button("Update base result"):
-                    try:
-                        updated = False
-                        files = glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True)
-                        for jf in files:
-                            with open(jf, "r", encoding="utf-8") as f:
-                                rec0 = json.load(f)
-                            if str(rec0.get("name", "")).strip().lower() == str(base.get("name", "")).strip().lower():
-                                keep = {k: rec0.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
-                                keep["decomp"] = current_decomp
-                                with open(jf, "w", encoding="utf-8") as g:
-                                    json.dump(_json_ready(keep), g, indent=2)
-                                st.session_state["last_saved_path"] = jf
-                                st.session_state["last_save_error"] = ""
-                                st.success("Updated base at: {}".format(jf))
-                                updated = True
-                                break
-                        if not updated:
-                            st.warning("No matching base record found to update.")
-                    except Exception as e:
-                        st.session_state["last_saved_path"] = ""
-                        st.session_state["last_save_error"] = "Update failed: {}".format(e)
-                        st.error(st.session_state["last_save_error"])
-
-    st.divider()
-    if st.button("Reload catalog now"):
-        st.rerun()
+    st.subheader("Raw JSON")
+    st.code(json.dumps({k: v for k, v in r.items() if k not in ("_ts","_path")}, indent=2))
