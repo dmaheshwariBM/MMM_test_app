@@ -195,7 +195,7 @@ st.markdown(
     f"""
 <div class="hero">
   <div class="hero-title">Marketing Mix Modeling Studio <span class="badge">Home</span></div>
-  <p class="hero-sub">Minimalist workspace to upload data, run models, view results, and optimize budgets. Page ID: {PAGE_ID}</p>
+  <p class="hero-sub">Workspace to upload data, run models, view results, and optimize budgets. Page ID: {PAGE_ID}</p>
 </div>
 """,
     unsafe_allow_html=True,
