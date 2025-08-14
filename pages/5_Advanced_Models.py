@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from core import advanced_models as am
-importlib.reload(am)  # ensure latest core is used
+importlib.reload(am)  # pick up latest core
 
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
 st.caption(f"Core version: **{getattr(am, 'ADV_MODELS_VERSION', 'unknown')}**")
@@ -127,17 +127,17 @@ num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
 base_set_disp = set(features_disp)
 
 st.caption(f"Dataset: **{base['dataset']}** • Target: **{base.get('target','?')}**")
+st.info(f"Base % (current): **{float(decomp0.get('base_pct',0)):.2f}%**")
 
 # ---------------------------
 # Tabs
 # ---------------------------
-tab1, tab2, tab3 = st.tabs(["📊 Breakout split", "➕ Residual re-attribution", "🧩 Pathway redistribution"])
+tab1, tab2, tab3 = st.tabs(["📊 Breakout split", "➕ Residual (on Base)", "🧩 Pathway redistribution"])
 
 # ===== Breakout split =====
 with tab1:
     st.subheader("Breakout split")
-    st.caption("Redistribute one channel’s impact to chosen sub-metrics. Totals preserved.")
-    parent = st.selectbox("Channel to split", options=features_disp)
+    parent = st.selectbox("Channel to split (from base)", options=features_disp)
     candidates = [c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))]
     subs = st.multiselect("Sub-metrics (not in base model)", options=candidates)
 
@@ -162,25 +162,32 @@ with tab1:
             st.error("Breakout failed.")
             st.exception(e)
 
-# ===== Residual re-attribution =====
+# ===== Residual (on Base) =====
 with tab2:
-    st.subheader("Residual re-attribution")
-    st.caption("Move a FRACTION of Base % to selected new channels. Base % decreases by that amount; Incremental % increases.")
-    st.info(f"Current Base %: **{float(decomp0.get('base_pct',0)):.2f}%**")
+    st.subheader("Residual re-attribution (regress Base on new channels)")
+    st.caption("We fit the **Base (intercept)** series on selected channels. The **fitted share of Base** is moved from Base% to those channels (split by fitted contributions).")
 
-    extra = st.multiselect("Extra channels (not in base model)", options=[c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))])
-    frac = st.slider("Fraction of Base % to allocate", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
+    extra = st.multiselect("Channels to explain Base (not in base model)", options=[c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))])
+    frac = st.slider("Apply what fraction of the *fitted* Base to reattribute?", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
 
     if st.button("Run residual re-attribution", type="primary"):
         try:
             out = am.residual_reattribute(df=df, base_record=base, extra_channels=extra, fraction=frac)
             new_decomp = am.apply_decomp_update(base, df, out)
-            st.success(f"Residual re-attribution computed (moved {out['fraction']*100:.0f}% of Base). Preview below:")
+            st.success(f"Residual computed. Fitted share of Base = {out['fitted_share_of_base']*100:.1f}%. Applied fraction = {out['fraction']*100:.0f}%.")
+            st.write(pd.DataFrame([{
+                "Base % before": out["base_pct_before"],
+                "Base % after": out["base_pct_after"],
+                "Fitted Base share (%)": out["fitted_share_of_base"] * 100.0
+            }]))
+            st.dataframe(pd.DataFrame({"Channel": list(out["allocated"].keys()),
+                                       "Allocated (pp)": list(out["allocated"].values())}),
+                         use_container_width=True)
             _render_decomp(new_decomp)
 
             c1, c2 = st.columns(2)
             with c1:
-                name_new = st.text_input("Save as name", value=f"{base['name']}__residual_f{int(frac*100)}")
+                name_new = st.text_input("Save as name", value=f"{base['name']}__residual_on_base")
                 if st.button("Save as new result", key="save_resid"):
                     where = _persist_record(name_new, base.get("target","?"), base["dataset"], {**base, "type": "residual_reattribute", "decomp": new_decomp})
                     st.success(f"Saved to `{where}`.")
@@ -195,7 +202,6 @@ with tab2:
 # ===== Pathway redistribution =====
 with tab3:
     st.subheader("Pathway redistribution")
-    st.caption("Move a data-inferred share of Channel A’s impact to Channel B. Totals preserved.")
     if not features_disp:
         st.warning("No channels found in base features.")
     else:
@@ -207,6 +213,12 @@ with tab3:
                 out = am.pathway_redistribute(df=df, base_record=base, channel_A=A, channel_B=B)
                 new_decomp = am.apply_decomp_update(base, df, out)
                 st.success("Pathway redistribution computed. Preview below:")
+                st.write(pd.DataFrame([{
+                    "Share from A→B": out["share_from_A_to_B"],
+                    "Moved (pp)": out["moved_pct_points"],
+                    "A old": out["A_old"], "A new": out["A_new"],
+                    "B old": out["B_old"], "B new": out["B_new"],
+                }]))
                 _render_decomp(new_decomp)
 
                 c1, c2 = st.columns(2)
