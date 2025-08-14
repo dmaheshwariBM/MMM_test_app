@@ -1,253 +1,242 @@
 # core/transforms.py
+# v2.3.0  ASCII-only. Transform, lag/adstock, scaling + suggestions and pipeline apply.
+
 from __future__ import annotations
+from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Tuple, Optional
 
-# ---------------------------
-# Basic helpers
-# ---------------------------
-def to_num(s: pd.Series) -> pd.Series:
-    return pd.to_numeric(s, errors="coerce")
+# ---------------- Basics ----------------
 
-# ---------------------------
-# Curves & suggestions
-# ---------------------------
-def transform_none(x: pd.Series, k: float = 0.0) -> pd.Series:
-    return to_num(x).fillna(0.0)
+def ensure_numeric_series(s: pd.Series) -> pd.Series:
+    """Coerce to numeric and fill NaNs with 0.0 for stable math."""
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
-def transform_log(x: pd.Series, k: float = 0.01) -> pd.Series:
+def adstock_finite(values: pd.Series, lag: int = 0, decay: float = 0.0) -> pd.Series:
     """
-    f(x) = log(1 + k * max(x,0))
+    Finite adstock with lag (L) and decay r in [0,1].
+    Effective_t = x_t + r*x_{t-1} + r^2*x_{t-2} + ... + r^L*x_{t-L}
     """
-    x = to_num(x).fillna(0.0)
-    x = np.maximum(x, 0.0)
+    x = ensure_numeric_series(values).to_numpy(dtype=float)
+    L = max(0, int(lag))
+    r = float(max(0.0, min(1.0, decay)))
+    if L == 0 or r == 0.0:
+        return pd.Series(x, index=values.index)
+
+    # kernel = [1, r, r^2, ..., r^L]
+    k = np.array([r**i for i in range(L + 1)], dtype=float)
+    y_full = np.convolve(x, k, mode="full")
+    y = y_full[: len(x)]
+    return pd.Series(y, index=values.index)
+
+# ---------------- Transformations ----------------
+
+def tfm_none(x: pd.Series, **_) -> pd.Series:
+    return ensure_numeric_series(x)
+
+def tfm_log(x: pd.Series, k: float = 1.0) -> pd.Series:
+    """
+    y = log(1 + k*x), k>0
+    Helpful for right-skewed spend/volume metrics.
+    """
     k = float(max(k, 1e-12))
-    return pd.Series(np.log1p(k * x), index=x.index)
+    return np.log1p(k * ensure_numeric_series(x))
 
-def transform_negexp(x: pd.Series, k: float = 0.01) -> pd.Series:
+def tfm_negexp(x: pd.Series, k: float = 0.01, beta: float = 1.0) -> pd.Series:
     """
-    f(x) = 1 - exp(-k * max(x,0))
+    y = beta * (1 - exp(-k*x)), k>=0, beta>=0
+    Saturating response with diminishing returns.
     """
-    x = to_num(x).fillna(0.0)
-    x = np.maximum(x, 0.0)
-    k = float(max(k, 1e-12))
-    return pd.Series(1.0 - np.exp(-k * x), index=x.index)
+    k = float(max(0.0, k))
+    beta = float(max(0.0, beta))
+    z = ensure_numeric_series(x)
+    return beta * (1.0 - np.exp(-k * z))
 
-def suggest_k(series: pd.Series, tfm: str) -> float:
-    """
-    Suggest curvature k from data.
-      - Log:     k ≈ 1 / mean(x_pos)
-      - NegExp:  k ≈ ln(2) / mean(x_pos)   (half-saturation at mean)
-    Fallback: 0.01
-    """
-    s = to_num(series)
-    s = s[s > 0]
-    if s.empty:
-        return 0.01
-    m = float(s.mean())
-    if m <= 0:
-        return 0.01
-    tfm = (tfm or "").strip().lower()
-    if tfm in ("log", "logarithm", "logarithmic"):
-        return float(1.0 / m)
-    return float(np.log(2.0) / m)
-
-# ---------------------------
-# Finite adstock (your formula)
-# Effective_t = x_t + a*x_{t-1} + ... + a^K * x_{t-K}
-# ---------------------------
-def adstock_finite(x: pd.Series, alpha: float, K: int) -> pd.Series:
-    alpha = float(alpha)
-    K = int(max(0, K))
-    x_num = to_num(x).fillna(0.0)
-    idx = x_num.index
-    x_vals = x_num.values.astype(float)
-
-    if K == 0 or alpha <= 0.0:
-        return pd.Series(x_vals, index=idx)
-
-    kernel = np.power(alpha, np.arange(0, K + 1, dtype=float))  # [1, a, a^2, ..., a^K]
-    conv = np.convolve(x_vals, kernel, mode="full")[: len(x_vals)]
-    return pd.Series(conv, index=idx)
-
-# ---------------------------
-# Scaling
-# ---------------------------
-def scale_none(s: pd.Series, **kwargs) -> pd.Series:
-    return to_num(s).fillna(0.0)
-
-def scale_minmax(s: pd.Series, scale_min: float = 0.0, scale_max: float = 1.0, **kwargs) -> pd.Series:
-    s = to_num(s).fillna(0.0)
-    mn = float(np.nanmin(s.values)) if len(s) else 0.0
-    mx = float(np.nanmax(s.values)) if len(s) else 0.0
-    denom = mx - mn
-    if denom <= 0:
-        return pd.Series(np.full(len(s), float(scale_min)), index=s.index)
-    out = (s - mn) / denom
-    return pd.Series(out * (scale_max - scale_min) + scale_min, index=s.index)
-
-def scale_standard(s: pd.Series, **kwargs) -> pd.Series:
-    s = to_num(s).fillna(0.0)
-    mu = float(np.nanmean(s.values)) if len(s) else 0.0
-    sd = float(np.nanstd(s.values, ddof=0)) if len(s) else 0.0
-    if sd <= 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return pd.Series((s - mu) / sd, index=s.index)
-
-def scale_robust(s: pd.Series, **kwargs) -> pd.Series:
-    s = to_num(s).fillna(0.0)
-    med = float(np.nanmedian(s.values)) if len(s) else 0.0
-    q1 = float(np.nanpercentile(s.values, 25)) if len(s) else 0.0
-    q3 = float(np.nanpercentile(s.values, 75)) if len(s) else 0.0
-    iqr = q3 - q1
-    if iqr <= 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return pd.Series((s - med) / iqr, index=s.index)
-
-def scale_meannorm(s: pd.Series, **kwargs) -> pd.Series:
-    s = to_num(s).fillna(0.0)
-    mu = float(np.nanmean(s.values)) if len(s) else 0.0
-    if abs(mu) <= 1e-12:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return pd.Series(s / mu, index=s.index)
-
-def scale_maxnorm(s: pd.Series, **kwargs) -> pd.Series:
-    s = to_num(s).fillna(0.0)
-    mx = float(np.nanmax(s.values)) if len(s) else 0.0
-    if mx <= 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return pd.Series(s / mx, index=s.index)
-
-def scale_unitlength(s: pd.Series, **kwargs) -> pd.Series:
-    s = to_num(s).fillna(0.0)
-    l2 = float(np.sqrt(np.nansum((s.values) ** 2))) if len(s) else 0.0
-    if l2 <= 0:
-        return pd.Series(np.zeros(len(s)), index=s.index)
-    return pd.Series(s / l2, index=s.index)
-
-SCALERS = {
-    "None": scale_none,
-    "MinMax": scale_minmax,                  # uses scale_min, scale_max
-    "Standardize (z-score)": scale_standard,
-    "Robust (median/IQR)": scale_robust,
-    "Mean norm (÷ mean)": scale_meannorm,
-    "Max norm (÷ max)": scale_maxnorm,
-    "Unit length (L2)": scale_unitlength,
-}
-
-# ---------------------------
-# Apply order: transform ↔ adstock+lag, then scaling
-# ---------------------------
-def apply_with_order(
+def tfm_negexp_cannibalized(
     x: pd.Series,
-    transform: str,
-    k: float,
-    lag_months: int,
-    adstock_alpha: float,
-    order: str,
-    scaling: str = "None",
-    scale_min: float = 0.0,
-    scale_max: float = 1.0,
+    pool: Optional[pd.Series] = None,
+    k: float = 0.01,
+    beta: float = 1.0,
+    gamma: float = 0.0
 ) -> pd.Series:
     """
-    order options:
-      - 'Transform→Adstock+Lag'
-      - 'Adstock+Lag→Transform'
-    Scaling is applied at the end.
+    Negative exponential with a simple cannibalization factor (0..1).
+    y_base = beta * (1 - exp(-k*x))
+    y = y_base * (1 - gamma * norm(pool)), where norm(pool) uses [0,1] scaling.
+    If pool is None or pool has no variance, cannibalization has no effect.
     """
-    K = int(max(0, lag_months))
-    a = float(np.clip(adstock_alpha, 0.0, 1.0))
-    x_num = to_num(x).fillna(0.0)
+    y_base = tfm_negexp(x, k=k, beta=beta)
+    g = float(max(0.0, min(1.0, gamma)))
+    if pool is None or len(pool) != len(x):
+        return y_base
+    p = ensure_numeric_series(pool)
+    pmin, pmax = float(np.min(p)), float(np.max(p))
+    if pmax <= pmin:
+        return y_base
+    p_norm = (p - pmin) / (pmax - pmin)
+    y = y_base * (1.0 - g * p_norm)
+    y = np.maximum(y, 0.0)
+    return pd.Series(y, index=x.index)
 
-    # adstock per your formula
-    x_ad = adstock_finite(x_num, a, K)
+# ---------------- Scaling ----------------
 
-    t = (transform or "none").strip().lower()
-    if order.startswith("Transform"):
-        if t in ("log", "logarithm", "logarithmic"):
-            base = transform_log(x_num, k)
-        elif t in ("negexp", "negative_exponential", "neg_exp"):
-            base = transform_negexp(x_num, k)
-        else:
-            base = transform_none(x_num, 0.0)
-        out = adstock_finite(base, a, K)
-    else:
-        if t in ("log", "logarithm", "logarithmic"):
-            out = transform_log(x_ad, k)
-        elif t in ("negexp", "negative_exponential", "neg_exp"):
-            out = transform_negexp(x_ad, k)
-        else:
-            out = x_ad
+def scale_none(s: pd.Series) -> pd.Series:
+    return ensure_numeric_series(s)
 
-    out = to_num(out).fillna(0.0)
+def scale_minmax01(s: pd.Series) -> pd.Series:
+    x = ensure_numeric_series(s)
+    vmin, vmax = float(np.min(x)), float(np.max(x))
+    if vmax <= vmin:
+        return pd.Series(np.zeros_like(x), index=s.index)
+    return (x - vmin) / (vmax - vmin)
 
-    # scaling last
-    scaling = (scaling or "None").strip()
-    scaler = SCALERS.get(scaling, scale_none)
-    if scaler is scale_minmax:
-        out = scaler(out, scale_min=scale_min, scale_max=scale_max)
-    else:
-        out = scaler(out)
+def scale_zscore(s: pd.Series) -> pd.Series:
+    x = ensure_numeric_series(s)
+    mu, sd = float(np.mean(x)), float(np.std(x))
+    if sd <= 0:
+        return pd.Series(np.zeros_like(x), index=s.index)
+    return (x - mu) / sd
 
-    return out
+# ---------------- Suggestions ----------------
 
-# ---------------------------
-# Bulk apply
-# ---------------------------
-def apply_bulk(
+def _finite_median(x: pd.Series) -> float:
+    arr = ensure_numeric_series(x).replace([np.inf, -np.inf], np.nan).dropna().values
+    if arr.size == 0:
+        return 1.0
+    return float(np.median(arr))
+
+def suggest_transform_type(x: pd.Series) -> str:
+    """
+    Heuristic:
+    - If skewness > ~1.0, suggest 'log'
+    - Else if max >> median (>= 10x), suggest 'negexp'
+    - Else 'none'
+    """
+    z = ensure_numeric_series(x)
+    med = _finite_median(z)
+    try:
+        skew = float(pd.Series(z).skew())
+    except Exception:
+        skew = 0.0
+    ratio = (float(np.max(z)) / med) if med > 0 else 0.0
+    if skew > 1.0:
+        return "log"
+    if ratio >= 10.0:
+        return "negexp"
+    return "none"
+
+def suggest_k_for_negexp(x: pd.Series) -> float:
+    """
+    Choose k so that median(x) reaches ~50% of saturation: 1 - exp(-k*median) ~ 0.5
+    => k ~ ln(2)/median(x)
+    """
+    med = _finite_median(x)
+    if med <= 0:
+        return 0.01
+    return float(np.log(2.0) / med)
+
+def suggest_k_for_log(x: pd.Series) -> float:
+    """
+    Keep log argument O(1): set k ~ 1/max(x) where max(x) > 0
+    """
+    z = ensure_numeric_series(x)
+    mx = float(np.max(z)) if len(z) else 0.0
+    if mx <= 0:
+        return 1.0
+    return float(1.0 / mx)
+
+def suggest_adstock_decay(x: pd.Series) -> float:
+    """
+    Suggest decay ~= lag-1 autocorrelation, clipped to [0,0.9].
+    """
+    z = ensure_numeric_series(x).values.astype(float)
+    if len(z) < 3:
+        return 0.5
+    z0 = z[:-1]
+    z1 = z[1:]
+    num = float(np.sum((z0 - z0.mean()) * (z1 - z1.mean())))
+    den = float(np.sqrt(np.sum((z0 - z0.mean())**2) * np.sum((z1 - z1.mean())**2)))
+    r = num / den if den > 0 else 0.0
+    return float(max(0.0, min(0.9, r)))
+
+# ---------------- Pipeline ----------------
+
+def apply_pipeline(
     df: pd.DataFrame,
-    config_rows: List[Dict[str, Any]],
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    metric: str,
+    params: Dict[str, Any],
+    cannibal_pool_cols: Optional[List[str]] = None
+) -> pd.Series:
     """
-    config_rows: list of rows with keys:
-      metric, transform, k, lag_months, adstock_alpha, order, scaling, scale_min, scale_max, use (bool)
-    Returns:
-      df_out with new columns "<metric>__tfm"
-      meta dict with the same config
+    Apply transform + (lag, adstock) + scaling to df[metric] based on params.
+    params keys (all optional with defaults):
+      - transform: 'none'|'log'|'negexp'|'negexp_cann'
+      - k (float), beta (float), gamma (float for cannibalization)
+      - order: 'transform_then_adstock' or 'adstock_then_transform'
+      - lag (int), adstock (float in [0,1])
+      - scaling: 'none'|'minmax'|'zscore'
+    """
+    x = df[metric] if metric in df.columns else pd.Series([0.0]*len(df))
+    x = ensure_numeric_series(x)
+
+    transform = str(params.get("transform", "none")).lower()
+    order = str(params.get("order", "transform_then_adstock")).lower()
+    lag = int(params.get("lag", 0) or 0)
+    ad = float(params.get("adstock", 0.0) or 0.0)
+    scaling = str(params.get("scaling", "none")).lower()
+
+    k = float(params.get("k", 1.0) or 1.0)
+    beta = float(params.get("beta", 1.0) or 1.0)
+    gamma = float(params.get("gamma", 0.0) or 0.0)
+
+    pool = None
+    if transform == "negexp_cann" and cannibal_pool_cols:
+        # aggregate pool columns except the metric itself
+        cols = [c for c in cannibal_pool_cols if c in df.columns and c != metric]
+        if cols:
+            pool = ensure_numeric_series(df[cols].sum(axis=1))
+
+    def apply_transform(series: pd.Series) -> pd.Series:
+        if transform == "none":
+            return tfm_none(series)
+        if transform == "log":
+            return tfm_log(series, k=k)
+        if transform == "negexp":
+            return tfm_negexp(series, k=k, beta=beta)
+        if transform == "negexp_cann":
+            return tfm_negexp_cannibalized(series, pool=pool, k=k, beta=beta, gamma=gamma)
+        return tfm_none(series)
+
+    def apply_adstock(series: pd.Series) -> pd.Series:
+        return adstock_finite(series, lag=lag, decay=ad)
+
+    # order
+    if order == "adstock_then_transform":
+        y = apply_transform(apply_adstock(x))
+    else:
+        y = apply_adstock(apply_transform(x))
+
+    # scaling
+    if scaling == "minmax":
+        y = scale_minmax01(y)
+    elif scaling == "zscore":
+        y = scale_zscore(y)
+    else:
+        y = scale_none(y)
+
+    return y
+
+def apply_many(
+    df: pd.DataFrame,
+    config_map: Dict[str, Dict[str, Any]],
+    cannibal_pools: Optional[Dict[str, List[str]]] = None,
+    suffix: str = "__tfm"
+) -> pd.DataFrame:
+    """
+    Apply pipelines for multiple metrics. Returns a copy with new columns <metric><suffix>.
     """
     out = df.copy()
-    cleaned_cfg = []
-    for row in config_rows:
-        try:
-            metric = str(row["metric"])
-        except Exception:
-            continue
-        use = bool(row.get("use", True))
-        if not use:
-            continue
-
-        transform = str(row.get("transform", "None"))
-        k = float(row.get("k", 0.01))
-        lag = int(row.get("lag_months", 0))
-        alpha = float(row.get("adstock_alpha", 0.0))
-        order = str(row.get("order", "Transform→Adstock+Lag"))
-        scaling = str(row.get("scaling", "None"))
-        scale_min = float(row.get("scale_min", 0.0))
-        scale_max = float(row.get("scale_max", 1.0))
-
-        if metric not in out.columns:
-            continue
-
-        y = apply_with_order(
-            out[metric], transform, k, lag, alpha, order,
-            scaling=scaling, scale_min=scale_min, scale_max=scale_max
-        )
-        out[f"{metric}__tfm"] = y
-
-        cleaned_cfg.append({
-            "metric": metric,
-            "transform": transform,
-            "k": k,
-            "lag_months": lag,
-            "adstock_alpha": alpha,
-            "order": order,
-            "scaling": scaling,
-            "scale_min": scale_min,
-            "scale_max": scale_max,
-            "suggested_k": float(row.get("suggested_k", np.nan)),
-            "use": True
-        })
-
-    meta = {"config": cleaned_cfg}
-    return out, meta
+    for m, params in config_map.items():
+        pool_cols = (cannibal_pools or {}).get(m, [])
+        out[m + suffix] = apply_pipeline(df, m, params, pool_cols)
+    return out
