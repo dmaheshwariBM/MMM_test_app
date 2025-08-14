@@ -1,7 +1,12 @@
 # pages/6_Results.py
-# v1.9.1 — syntax-safe, robust save/load, persistent saved-path banner
+# v1.9.2  ASCII-only, syntax-safe, persistent saved-path banner, robust save/load
 
-import os, re, glob, json, pathlib, importlib
+import os
+import re
+import glob
+import json
+import pathlib
+import importlib
 from io import StringIO
 from datetime import datetime
 from typing import Dict, Any, List, Optional
@@ -10,22 +15,21 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_9_1"
-
-st.title("📊 Results — Compare, Inspect & Compose")
-st.caption("Page ID: '{}' • Persistent save message + robust writes".format(PAGE_ID))
+PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_9_2"
+st.title("Results")
+st.caption("Page ID: {}".format(PAGE_ID))
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ───────────────────────── Writable roots ─────────────────────────
+# ---------------- Writable roots (ASCII-only) ----------------
 def _abs(p: str) -> str:
     return os.path.abspath(p)
 
-CANDIDATE_RESULTS_ROOTS = []
-env_dir = os.environ.get("MMM_RESULTS_DIR")
-if env_dir:
-    CANDIDATE_RESULTS_ROOTS.append(_abs(env_dir))
+CANDIDATE_RESULTS_ROOTS: List[str] = []
+_env_dir = os.environ.get("MMM_RESULTS_DIR")
+if _env_dir:
+    CANDIDATE_RESULTS_ROOTS.append(_abs(_env_dir))
 CANDIDATE_RESULTS_ROOTS.append(_abs(os.path.expanduser("~/.mmm_results")))
 CANDIDATE_RESULTS_ROOTS.append(_abs("/tmp/mmm_results"))
 CANDIDATE_RESULTS_ROOTS.append(_abs("results"))
@@ -34,7 +38,7 @@ def _ensure_dir(path: str) -> bool:
     try:
         os.makedirs(path, exist_ok=True)
         probe = os.path.join(path, ".write_test")
-        with open(probe, "w") as f:
+        with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(probe)
         return True
@@ -51,16 +55,16 @@ def pick_writable_results_root() -> str:
 
 RESULTS_ROOT = pick_writable_results_root()
 
-# Persisted banner for last save status (survives reruns)
+# Persisted banners (survive reruns)
 if "last_saved_path" in st.session_state and st.session_state["last_saved_path"]:
-    st.success("Saved: `{}`".format(st.session_state["last_saved_path"]))
+    st.success("Saved: {}".format(st.session_state["last_saved_path"]))
 if "last_save_error" in st.session_state and st.session_state["last_save_error"]:
     st.error(st.session_state["last_save_error"])
 
-st.caption("Writable roots checked: " + ", ".join(["`{}`".format(r) for r in CANDIDATE_RESULTS_ROOTS]))
-st.caption("Using results root: `{}`".format(RESULTS_ROOT))
+st.caption("Writable roots checked: {}".format(", ".join(["{}".format(r) for r in CANDIDATE_RESULTS_ROOTS])))
+st.caption("Using results root: {}".format(RESULTS_ROOT))
 
-# ───────────────────────── Utilities ─────────────────────────
+# ---------------- Utilities ----------------
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:72]
 
@@ -119,7 +123,7 @@ def save_result_json(results_root: str, name: str, target: str, dataset: str, pa
     body.update(payload)
     body = _json_ready(body)
     full_path = os.path.join(out_dir, fname)
-    with open(full_path, "w") as f:
+    with open(full_path, "w", encoding="utf-8") as f:
         json.dump(body, f, indent=2)
     return full_path
 
@@ -133,7 +137,7 @@ def load_results_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
             if jf in seen:
                 continue
             try:
-                with open(jf, "r") as f:
+                with open(jf, "r", encoding="utf-8") as f:
                     r = json.load(f)
                 r["_path"] = jf
                 ts = r.get("batch_ts")
@@ -223,7 +227,7 @@ def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
 
 def metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
     m = r.get("metrics", {}) or {}
-    return {"R²": m.get("r2"), "Adj R²": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
+    return {"R2": m.get("r2"), "Adj R2": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
 
 def _short_type(t: str) -> str:
     mapping = {
@@ -240,13 +244,13 @@ def fmt_label(r: Dict[str, Any]) -> str:
     tp = _short_type(r.get("type", "base"))
     tgt = r.get("target", "?")
     ts = r.get("_ts")
-    when = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "—"
-    return "{} • {} • {} • {}".format(nm, tp, tgt, when)
+    when = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "-"
+    return "{} | {} | {} | {}".format(nm, tp, tgt, when)
 
 def _load_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(os.path.join(DATA_DIR, name))
 
-# ───────────────────── Import advanced core (for composer) ─────────────────────
+# ---------------- Import advanced core (optional) ----------------
 def _import_advanced_models():
     try:
         from core import advanced_models as am  # type: ignore
@@ -264,37 +268,37 @@ def _import_advanced_models():
 
 am = _import_advanced_models()
 if am is None:
-    st.warning("Advanced builder is disabled because `core/advanced_models.py` was not found.")
+    st.caption("Advanced core not found (core/advanced_models.py). Compose tab will still show, but operations require the core file.")
 else:
-    st.caption("Advanced core loaded from: `{}` (v {})".format(getattr(am, "__file__", "unknown"), getattr(am, "ADV_MODELS_VERSION", "?")))
+    st.caption("Advanced core: {} (v {})".format(getattr(am, "__file__", "unknown"), getattr(am, "ADV_MODELS_VERSION", "?")))
 
-# ───────────────────── Top actions ─────────────────────
-cols_top = st.columns([1,2,4])
-with cols_top[0]:
-    if st.button("🔄 Refresh list"):
+# ---------------- Top actions ----------------
+c1, c2, c3 = st.columns([1, 2, 3])
+with c1:
+    if st.button("Refresh list"):
         st.rerun()
-with cols_top[1]:
-    show_diag = st.toggle("Diagnostics", value=False, help="Show file scan details")
-with cols_top[2]:
-    st.caption("Scanning roots: " + ", ".join(["`{}`".format(r) for r in CANDIDATE_RESULTS_ROOTS]))
+with c2:
+    show_diag = st.toggle("Diagnostics", value=False)
+with c3:
+    st.caption("Scanning roots: {}".format(", ".join(["{}".format(r) for r in CANDIDATE_RESULTS_ROOTS])))
 
-# ───────────────────── Load catalog ─────────────────────
+# ---------------- Load catalog ----------------
 catalog = load_results_catalog(CANDIDATE_RESULTS_ROOTS)
 if show_diag:
-    st.info("Found {} saved JSON(s).".format(len(catalog)))
+    st.info("Found {} saved JSON file(s).".format(len(catalog)))
     for r in catalog[:25]:
-        st.write("•", r.get("_path"))
+        st.text(" - {}".format(r.get("_path")))
 
 if not catalog:
-    st.info("No saved models yet. Build & save a model (Modeling or Advanced Models), then come back here.")
+    st.info("No saved models yet. Build and save a model, then reload this page.")
     st.stop()
 
-# ───────────────────── Tabs ─────────────────────
-tab_cmp, tab_inspect, tab_compose = st.tabs(["📊 Compare", "🔎 Inspect one model", "🧩 Compose adjustments"])
+# ---------------- Tabs ----------------
+tab_cmp, tab_inspect, tab_compose = st.tabs(["Compare", "Inspect", "Compose"])
 
-# ==== Compare ====
+# ===== Compare =====
 with tab_cmp:
-    st.markdown("#### All runs (latest first)")
+    st.subheader("All runs (latest first)")
     summary_rows = []
     for r in catalog:
         summary_rows.append({
@@ -303,14 +307,14 @@ with tab_cmp:
             "Target": r.get("target", ""),
             "Saved at": r.get("_ts").strftime("%Y-%m-%d %H:%M:%S") if r.get("_ts") else "",
         })
-    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=min(400, 48*len(summary_rows)+40))
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=min(420, 48*max(1, len(summary_rows))+40))
 
     labels = [fmt_label(r) for r in catalog]
     default_sel = labels[:2] if len(labels) >= 2 else labels[:1]
-    chosen = st.multiselect("Select up to 5 models to compare", options=labels, default=default_sel, max_selections=5)
+    chosen = st.multiselect("Select up to 5 models", options=labels, default=default_sel, max_selections=5)
     if chosen:
         models = [catalog[labels.index(lbl)] for lbl in chosen]
-        baseline = st.selectbox("Baseline for Δ", options=chosen, index=0)
+        baseline = st.selectbox("Baseline for delta", options=chosen, index=0)
         st.divider()
 
         st.subheader("Fit metrics")
@@ -332,7 +336,7 @@ with tab_cmp:
         st.dataframe(decomp_df, use_container_width=True)
         st.bar_chart(decomp_df)
 
-        st.subheader("Impactable % by channel — aligned")
+        st.subheader("Impactable % by channel (aligned)")
         channels = sorted({ch for d in decomp_map.values() for ch in d.get("impactable_pct", {}).keys()})
         if channels:
             mat = []
@@ -344,7 +348,7 @@ with tab_cmp:
             impact_df = pd.DataFrame(mat).set_index("Channel")
             st.dataframe(impact_df, use_container_width=True)
 
-            st.markdown("**Δ vs baseline (selected above)**")
+            st.markdown("Delta vs baseline")
             if baseline in impact_df.columns:
                 deltas = impact_df.subtract(impact_df[baseline], axis=0)
                 st.dataframe(deltas, use_container_width=True)
@@ -353,52 +357,31 @@ with tab_cmp:
         csv_buf = StringIO()
         csv_buf.write("## metrics\n"); met_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
         csv_buf.write("## decomposition\n"); decomp_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
-        if 'impact_df' in locals():
+        if "impact_df" in locals():
             csv_buf.write("## impactable_by_channel\n"); impact_df.reset_index().to_csv(csv_buf, index=False); csv_buf.write("\n")
         csv_bytes = csv_buf.getvalue().encode("utf-8")
         st.download_button("Download comparison CSV", data=csv_bytes, file_name="mmm_results_comparison.csv", mime="text/csv")
 
-        st.subheader("Select for Budget Optimization")
-        to_budget = st.multiselect("Models to send", options=chosen, default=chosen[:min(3, len(chosen))])
-        if st.button("Send to Budget Optimization"):
-            skinny = []
-            for lbl in to_budget:
-                r = models[chosen.index(lbl)]
-                d = decomp_map[lbl]
-                skinny.append({
-                    "name": r.get("name"),
-                    "type": r.get("type"),
-                    "dataset": r.get("dataset"),
-                    "target": r.get("target"),
-                    "metrics": r.get("metrics", {}),
-                    "decomp": d,
-                    "features": r.get("features", []),
-                    "_path": r.get("_path", ""),
-                    "_ts": r.get("_ts").strftime("%Y-%m-%d %H:%M:%S") if r.get("_ts") else "",
-                })
-            st.session_state["budget_candidates"] = skinny
-            st.success("Sent {} model(s) to Budget Optimization.".format(len(skinny)))
-
-# ==== Inspect ====
+# ===== Inspect =====
 with tab_inspect:
-    st.markdown("#### Pick a saved run")
+    st.subheader("Pick a saved run")
     labels = [fmt_label(r) for r in catalog]
     i = st.selectbox("Saved model", options=list(range(len(labels))), format_func=lambda k: labels[k], index=0)
     r = catalog[i]
-    st.write("**Name**: {}  •  **Type**: {}  •  **Target**: {}  •  **Saved**: {}".format(
-        r.get('name'), _short_type(r.get('type','base')), r.get('target'), r.get('_ts')))
+    st.write("Name: {} | Type: {} | Target: {} | Saved: {}".format(
+        r.get("name"), _short_type(r.get("type", "base")), r.get("target"), r.get("_ts")))
     d = ensure_decomp(r)
     c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Base %", "{:.2f}%".format(d['base_pct']))
-    with c2: st.metric("Carryover %", "{:.2f}%".format(d['carryover_pct']))
-    with c3: st.metric("Incremental %", "{:.2f}%".format(d['incremental_pct']))
+    with c1: st.metric("Base %", "{:.2f}%".format(d["base_pct"]))
+    with c2: st.metric("Carryover %", "{:.2f}%".format(d["carryover_pct"]))
+    with c3: st.metric("Incremental %", "{:.2f}%".format(d["incremental_pct"]))
     imp = d.get("impactable_pct", {})
     if imp:
         dfv = pd.DataFrame({"Channel": list(imp.keys()), "Impactable %": list(imp.values())}).set_index("Channel")
         st.bar_chart(dfv)
         st.dataframe(dfv, use_container_width=True)
 
-# ==== Compose adjustments ====
+# ===== Compose (optional; needs core/advanced_models.py) =====
 with tab_compose:
     def _import_advanced_models_again():
         try:
@@ -417,13 +400,13 @@ with tab_compose:
 
     am2 = _import_advanced_models_again()
     if am2 is None:
-        st.warning("Install/restore `core/advanced_models.py` to use the composition workbench.")
+        st.warning("Install core/advanced_models.py to use Compose.")
         st.stop()
 
     labels = [fmt_label(r) for r in catalog]
-    k = st.selectbox("Base model to start from", options=list(range(len(labels))), format_func=lambda idx: labels[idx], index=0)
+    k = st.selectbox("Base model", options=list(range(len(labels))), format_func=lambda idx: labels[idx], index=0)
     base = catalog[k]
-    st.caption("Dataset: **{}** • Target: **{}**".format(base.get("dataset","?"), base.get("target","?")))
+    st.caption("Dataset: {} | Target: {}".format(base.get("dataset", "?"), base.get("target", "?")))
 
     ops_key = "compose_ops"
     if ops_key not in st.session_state:
@@ -432,7 +415,14 @@ with tab_compose:
     try:
         df_base = _load_csv(base["dataset"])
     except Exception as e:
-        st.error("Could not open dataset '{}'.".format(base.get("dataset"))); st.exception(e); st.stop()
+        st.error("Could not open dataset: {}".format(base.get("dataset"))); st.exception(e); st.stop()
+
+    # Require these functions in core
+    required = ["breakout_split", "residual_reattribute", "pathway_redistribute", "apply_decomp_update", "_ensure_decomp_from_record_or_recompute"]
+    missing = [fn for fn in required if not hasattr(am2, fn)]
+    if missing:
+        st.error("advanced_models missing: {}".format(", ".join(missing)))
+        st.stop()
 
     d0 = am2._ensure_decomp_from_record_or_recompute(base, df_base)
     features = [f for f in base.get("features", []) if f != "const"]
@@ -443,53 +433,53 @@ with tab_compose:
 
     cB, cR, cP = st.columns(3)
     with cB:
-        st.write("**Breakout split**")
+        st.write("Breakout split")
         parent = st.selectbox("Parent channel", options=features_disp, key="co_parent")
         subs = st.multiselect("Sub-metrics", options=not_in_base, key="co_subs")
-        if st.button("➕ Add Breakout"):
-            st.session_state[ops_key].append({"type":"breakout_split","parent": parent,"subs": subs})
+        if st.button("Add Breakout"):
+            st.session_state[ops_key].append({"type": "breakout_split", "parent": parent, "subs": subs})
     with cR:
-        st.write("**Residual (on Base)**")
+        st.write("Residual on Base")
         extras = st.multiselect("Explain Base with", options=not_in_base, key="co_extras")
         frac = st.slider("Fraction of fitted Base", 0.1, 1.0, 1.0, 0.1, key="co_frac")
-        if st.button("➕ Add Residual"):
-            st.session_state[ops_key].append({"type":"residual_reattribute","extras": extras,"fraction": float(frac)})
+        if st.button("Add Residual"):
+            st.session_state[ops_key].append({"type": "residual_reattribute", "extras": extras, "fraction": float(frac)})
     with cP:
-        st.write("**Pathway**")
+        st.write("Pathway")
         A = st.selectbox("From (A)", options=features_disp, key="co_A")
         B = st.selectbox("To (B)", options=[c for c in features_disp if c != A], key="co_B")
-        if st.button("➕ Add Pathway"):
-            st.session_state[ops_key].append({"type":"pathway_redistribute","A": A,"B": B})
+        if st.button("Add Pathway"):
+            st.session_state[ops_key].append({"type": "pathway_redistribute", "A": A, "B": B})
 
     st.divider()
-    st.markdown("##### Pipeline")
+    st.markdown("Pipeline")
     if not st.session_state[ops_key]:
-        st.info("No operations yet. Add Breakout / Residual / Pathway above.")
+        st.info("No operations yet.")
     else:
         pretty = []
         for idx, op in enumerate(st.session_state[ops_key], 1):
-            if op["type"]=="breakout_split":
+            if op["type"] == "breakout_split":
                 pretty.append({"#": idx, "Type": "breakout", "Parent": op["parent"], "Sub-metrics": ", ".join(op["subs"])})
-            elif op["type"]=="residual_reattribute":
+            elif op["type"] == "residual_reattribute":
                 pretty.append({"#": idx, "Type": "residual", "Extras": ", ".join(op["extras"]), "Fraction": op["fraction"]})
             else:
-                pretty.append({"#": idx, "Type": "pathway", "A→B": "{}→{}".format(op["A"], op["B"])})
+                pretty.append({"#": idx, "Type": "pathway", "A_to_B": "{}->{}".format(op["A"], op["B"])})
         st.dataframe(pd.DataFrame(pretty), use_container_width=True)
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("⟲ Clear all"):
+        c1_, c2_, c3_ = st.columns(3)
+        with c1_:
+            if st.button("Clear all"):
                 st.session_state[ops_key] = []
                 st.rerun()
-        with c2:
-            rm_idx = st.number_input("Remove step #", min_value=1, max_value=len(st.session_state[ops_key]), value=1, step=1)
-        with c3:
-            if st.button("🗑 Remove step"):
-                st.session_state[ops_key].pop(int(rm_idx)-1)
+        with c2_:
+            rm_idx = st.number_input("Remove step number", min_value=1, max_value=len(st.session_state[ops_key]), value=1, step=1)
+        with c3_:
+            if st.button("Remove step"):
+                st.session_state[ops_key].pop(int(rm_idx) - 1)
                 st.rerun()
 
     st.divider()
-    if st.button("▶ Preview composed result", type="primary"):
+    if st.button("Preview composed result"):
         try:
             rec = dict(base)
             current_decomp = am2._ensure_decomp_from_record_or_recompute(rec, df_base)
@@ -505,23 +495,23 @@ with tab_compose:
                 current_decomp = am2.apply_decomp_update(rec, df_base, out)
                 rec["decomp"] = current_decomp
 
-            st.success("Composed result preview")
+            st.success("Preview ready")
             d = current_decomp
-            c1, c2, c3 = st.columns(3)
-            with c1: st.metric("Base %", "{:.2f}%".format(d['base_pct']))
-            with c2: st.metric("Carryover %", "{:.2f}%".format(d['carryover_pct']))
-            with c3: st.metric("Incremental %", "{:.2f}%".format(d['incremental_pct']))
+            c1x, c2x, c3x = st.columns(3)
+            with c1x: st.metric("Base %", "{:.2f}%".format(d["base_pct"]))
+            with c2x: st.metric("Carryover %", "{:.2f}%".format(d["carryover_pct"]))
+            with c3x: st.metric("Incremental %", "{:.2f}%".format(d["incremental_pct"]))
             imp = d.get("impactable_pct", {})
             if imp:
                 dfv = pd.DataFrame({"Channel": list(imp.keys()), "Impactable %": list(imp.values())}).set_index("Channel")
                 st.bar_chart(dfv)
                 st.dataframe(dfv, use_container_width=True)
 
-            st.markdown("##### Save / Update / Send to Budget")
+            st.markdown("Save / Send")
             cL, cM, cR = st.columns(3)
             with cL:
-                nm = st.text_input("Save as name", value="{}__composite".format(base.get("name","base")), key="compose_name")
-                if st.button("💾 Save as new result", key="compose_save"):
+                nm = st.text_input("Save as name", value="{}__composite".format(base.get("name", "base")), key="compose_name")
+                if st.button("Save as new result", key="compose_save"):
                     try:
                         payload = {
                             "type": "composite",
@@ -532,18 +522,18 @@ with tab_compose:
                             "yhat": base.get("yhat", []),
                             "features": base.get("features", []),
                         }
-                        saved_file = save_result_json(RESULTS_ROOT, nm, base.get("target","?"), base.get("dataset","?"), payload)
+                        saved_file = save_result_json(RESULTS_ROOT, nm, base.get("target", "?"), base.get("dataset", "?"), payload)
                         st.session_state["last_saved_path"] = saved_file
                         st.session_state["last_save_error"] = ""
-                        st.success("Saved: `{}`".format(saved_file))
+                        st.success("Saved: {}".format(saved_file))
                     except Exception as e:
                         st.session_state["last_saved_path"] = ""
                         st.session_state["last_save_error"] = "Save failed: {}".format(e)
                         st.error(st.session_state["last_save_error"])
             with cM:
-                if st.button("📤 Send PREVIEW to Budget Optimization"):
+                if st.button("Send preview to Budget Optimization"):
                     preview_skinny = [{
-                        "name": "{}__composite_preview".format(base.get("name","base")),
+                        "name": "{}__composite_preview".format(base.get("name", "base")),
                         "type": "composite",
                         "dataset": base.get("dataset"),
                         "target": base.get("target"),
@@ -556,21 +546,21 @@ with tab_compose:
                     st.session_state["budget_candidates"] = preview_skinny
                     st.success("Preview sent to Budget Optimization.")
             with cR:
-                if st.button("✏ Update base result"):
+                if st.button("Update base result"):
                     try:
                         updated = False
                         files = glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True)
                         for jf in files:
-                            with open(jf, "r") as f:
+                            with open(jf, "r", encoding="utf-8") as f:
                                 rec0 = json.load(f)
-                            if str(rec0.get("name","")).strip().lower() == str(base.get("name","")).strip().lower():
+                            if str(rec0.get("name", "")).strip().lower() == str(base.get("name", "")).strip().lower():
                                 keep = {k: rec0.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = current_decomp
-                                with open(jf, "w") as g:
+                                with open(jf, "w", encoding="utf-8") as g:
                                     json.dump(_json_ready(keep), g, indent=2)
                                 st.session_state["last_saved_path"] = jf
                                 st.session_state["last_save_error"] = ""
-                                st.success("Updated base at: `{}`".format(jf))
+                                st.success("Updated base at: {}".format(jf))
                                 updated = True
                                 break
                         if not updated:
@@ -581,5 +571,5 @@ with tab_compose:
                         st.error(st.session_state["last_save_error"])
 
     st.divider()
-    if st.button("🔃 Reload catalog now"):
+    if st.button("Reload catalog now"):
         st.rerun()
