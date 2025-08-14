@@ -1,8 +1,7 @@
 # pages/1_Data_Upload.py
-# v1.6.0  ASCII-only. Upload, delete, inspect, and correlation.
+# v1.7.0  Upload, delete, inspect, and correlation (Altair heatmap; no matplotlib needed)
 
 import os
-import re
 from datetime import datetime
 from typing import List, Dict
 
@@ -10,12 +9,23 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Try Altair for heatmap (Streamlit ships with it); fall back to table-only if unavailable
+try:
+    import altair as alt
+    ALT_AVAILABLE = True
+except Exception:
+    ALT_AVAILABLE = False
+
 st.title("Data Upload")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ---------------- Utilities ----------------
+# Ensure guard state exists
+if "delete_all_guard" not in st.session_state:
+    st.session_state["delete_all_guard"] = False
+
+# ---------------- Helpers ----------------
 def _human_size(n: int) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
     s = float(max(0, n))
@@ -32,16 +42,15 @@ def _load_df(path: str, excel_sheet: str = None) -> pd.DataFrame:
         return pd.read_csv(path)
     else:
         if excel_sheet is None:
-            # default to first sheet
             xls = pd.ExcelFile(path)
             sheet = xls.sheet_names[0]
             return pd.read_excel(path, sheet_name=sheet)
         return pd.read_excel(path, sheet_name=excel_sheet)
 
-# Persisted save/delete banners from other pages
-if "last_saved_path" in st.session_state and st.session_state["last_saved_path"]:
+# Cross-page save banners (from Modeling/Advanced/Results)
+if st.session_state.get("last_saved_path"):
     st.success("Saved: {}".format(st.session_state["last_saved_path"]))
-if "last_save_error" in st.session_state and st.session_state["last_save_error"]:
+if st.session_state.get("last_save_error"):
     st.error(st.session_state["last_save_error"])
 
 # ---------------- Upload ----------------
@@ -54,12 +63,15 @@ if uploaded:
     for uf in uploaded:
         try:
             dest = os.path.join(DATA_DIR, uf.name)
+            # Overwrite if exists to keep things simple/explicit
             with open(dest, "wb") as f:
                 f.write(uf.getbuffer())
             saved += 1
         except Exception as e:
             st.error("Failed to save {}: {}".format(uf.name, e))
-    st.success("Uploaded {} file(s) to data/".format(saved))
+    if saved:
+        st.success("Uploaded {} file(s) to data/".format(saved))
+        st.rerun()
 
 # ---------------- Inventory + Delete ----------------
 st.subheader("Files in data/")
@@ -83,28 +95,32 @@ else:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, height=min(360, 40 + 38*max(1, len(rows))))
 
     del_sel = st.multiselect("Select files to delete", options=files)
-    cols_del = st.columns([1,1,3])
-    with cols_del[0]:
+    c1, c2, c3 = st.columns([1,1,3])
+    with c1:
         if st.button("Delete selected"):
-            deleted, errs = 0, 0
-            for fn in del_sel:
-                try:
-                    os.remove(os.path.join(DATA_DIR, fn))
-                    deleted += 1
-                except Exception as e:
-                    errs += 1
-                    st.error("Could not delete {}: {}".format(fn, e))
-            if deleted:
-                st.success("Deleted {} file(s).".format(deleted))
-            st.experimental_rerun()  # refresh list
-    with cols_del[1]:
+            if not del_sel:
+                st.warning("Select one or more files to delete.")
+            else:
+                deleted, errs = 0, 0
+                for fn in del_sel:
+                    try:
+                        os.remove(os.path.join(DATA_DIR, fn))
+                        deleted += 1
+                    except Exception as e:
+                        errs += 1
+                        st.error("Could not delete {}: {}".format(fn, e))
+                if deleted:
+                    st.success("Deleted {} file(s).".format(deleted))
+                st.rerun()
+    with c2:
         if st.button("Delete ALL (guarded)"):
             st.session_state["delete_all_guard"] = True
-    if st.session_state.get("delete_all_guard"):
+
+    if st.session_state["delete_all_guard"]:
         st.warning("Type DELETE ALL to confirm full purge of data/ folder.")
         confirm = st.text_input("Type exactly: DELETE ALL")
-        c1, c2 = st.columns(2)
-        with c1:
+        cL, cR = st.columns(2)
+        with cL:
             if st.button("Confirm full delete"):
                 if confirm.strip().upper() == "DELETE ALL":
                     errs = 0
@@ -118,13 +134,13 @@ else:
                         st.success("All files deleted.")
                     else:
                         st.error("Some files could not be deleted.")
-                    st.experimental_rerun()
+                    st.rerun()
                 else:
                     st.error("Confirmation text did not match.")
-        with c2:
+        with cR:
             if st.button("Cancel"):
                 st.session_state["delete_all_guard"] = False
-                st.experimental_rerun()
+                st.rerun()
 
 # ---------------- Inspect and Correlation ----------------
 st.subheader("Inspect a file")
@@ -139,8 +155,7 @@ excel_sheet = None
 if sel_file.lower().endswith(".xlsx"):
     try:
         xls = pd.ExcelFile(os.path.join(DATA_DIR, sel_file))
-        sheet = st.selectbox("Excel sheet", options=xls.sheet_names, index=0)
-        excel_sheet = sheet
+        excel_sheet = st.selectbox("Excel sheet", options=xls.sheet_names, index=0)
     except Exception as e:
         st.error("Could not read Excel sheets: {}".format(e))
 
@@ -151,66 +166,80 @@ try:
 except Exception as e:
     st.error("Failed to load {}: {}".format(sel_file, e))
 
-if not df.empty:
-    st.markdown("Preview (up to first 500 rows)")
-    st.dataframe(df.head(500), use_container_width=True, height=360)
+if df.empty:
+    st.info("No rows to display.")
+    st.stop()
 
-    # quick info
-    st.markdown("Summary")
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Rows", len(df))
-    with c2: st.metric("Columns", len(df.columns))
-    with c3: st.metric("Numeric columns", int(sum(pd.api.types.is_numeric_dtype(df[c]) for c in df.columns)))
+st.markdown("Preview (up to first 500 rows)")
+st.dataframe(df.head(500), use_container_width=True, height=360)
 
-    # dtypes and nulls
-    meta = pd.DataFrame({
-        "column": df.columns,
-        "dtype": [str(df[c].dtype) for c in df.columns],
-        "nulls": [int(df[c].isna().sum()) for c in df.columns],
-        "null_pct": [round(100.0*df[c].isna().mean(), 2) for c in df.columns],
-    })
-    st.dataframe(meta, use_container_width=True, height=min(300, 40 + 22*max(1, len(meta))))
+# quick info
+st.markdown("Summary")
+c1, c2, c3 = st.columns(3)
+with c1: st.metric("Rows", len(df))
+with c2: st.metric("Columns", len(df.columns))
+with c3: st.metric("Numeric columns", int(sum(pd.api.types.is_numeric_dtype(df[c]) for c in df.columns)))
 
-    st.divider()
-    st.subheader("Correlation matrix")
-    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    if not num_cols:
-        st.info("No numeric columns in this file.")
-    else:
-        default_sel = num_cols[: min(8, len(num_cols))]
-        sel_cols = st.multiselect("Select numeric metrics", options=num_cols, default=default_sel)
-        method = st.selectbox("Method", options=["pearson", "spearman", "kendall"], index=0)
-        if st.button("Compute correlation"):
-            if len(sel_cols) < 2:
-                st.warning("Select at least two columns.")
-            else:
-                sub = df[sel_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-                corr = sub.corr(method=method)
-                st.dataframe(corr, use_container_width=True)
+# dtypes and nulls
+meta = pd.DataFrame({
+    "column": df.columns,
+    "dtype": [str(df[c].dtype) for c in df.columns],
+    "nulls": [int(df[c].isna().sum()) for c in df.columns],
+    "null_pct": [round(100.0*df[c].isna().mean(), 2) for c in df.columns],
+})
+st.dataframe(meta, use_container_width=True, height=min(300, 40 + 22*max(1, len(meta))))
 
-                # optional heatmap using matplotlib (no external deps)
-                try:
-                    import matplotlib.pyplot as plt
-                    import numpy as np
-                    fig, ax = plt.subplots()
-                    im = ax.imshow(corr.values)
-                    ax.set_xticks(np.arange(len(sel_cols)))
-                    ax.set_yticks(np.arange(len(sel_cols)))
-                    ax.set_xticklabels(sel_cols, rotation=45, ha="right")
-                    ax.set_yticklabels(sel_cols)
-                    ax.set_title("Correlation ({})".format(method))
-                    for i in range(len(sel_cols)):
-                        for j in range(len(sel_cols)):
-                            ax.text(j, i, "{:.2f}".format(corr.values[i, j]), ha="center", va="center", fontsize=8)
-                    st.pyplot(fig, clear_figure=True)
-                except Exception:
-                    st.info("Matplotlib not available; showing table only.")
+st.divider()
+st.subheader("Correlation matrix")
+num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+if not num_cols:
+    st.info("No numeric columns in this file.")
+else:
+    default_sel = num_cols[: min(8, len(num_cols))]
+    sel_cols = st.multiselect("Select numeric metrics", options=num_cols, default=default_sel)
+    method = st.selectbox("Method", options=["pearson", "spearman", "kendall"], index=0)
+    if st.button("Compute correlation"):
+        if len(sel_cols) < 2:
+            st.warning("Select at least two columns.")
+        else:
+            sub = df[sel_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            corr = sub.corr(method=method)
+            st.dataframe(corr, use_container_width=True)
 
-                # download
-                csv_bytes = corr.to_csv(index=True).encode("utf-8")
-                st.download_button(
-                    "Download correlation CSV",
-                    data=csv_bytes,
-                    file_name="{}_correlation.csv".format(os.path.splitext(sel_file)[0]),
-                    mime="text/csv",
+            # Altair heatmap (no matplotlib dependency)
+            if ALT_AVAILABLE:
+                corr_reset = corr.reset_index().melt(id_vars="index")
+                corr_reset.columns = ["X", "Y", "value"]
+                chart = (
+                    alt.Chart(corr_reset)
+                    .mark_rect()
+                    .encode(
+                        x=alt.X("X:O", title=None),
+                        y=alt.Y("Y:O", title=None),
+                        color=alt.Color("value:Q", scale=alt.Scale(domain=[-1, 1], scheme="redblue")),
+                        tooltip=[alt.Tooltip("X:O"), alt.Tooltip("Y:O"), alt.Tooltip("value:Q", format=".2f")],
+                    )
+                    .properties(width=min(60*len(sel_cols), 900), height=min(60*len(sel_cols), 900), title="Correlation ({})".format(method))
                 )
+                labels = (
+                    alt.Chart(corr_reset)
+                    .mark_text(baseline="middle", fontSize=10)
+                    .encode(
+                        x="X:O",
+                        y="Y:O",
+                        text=alt.Text("value:Q", format=".2f"),
+                        color=alt.condition(alt.datum.value < 0, alt.value("#111111"), alt.value("#111111")),
+                    )
+                )
+                st.altair_chart(chart + labels, use_container_width=True)
+            else:
+                st.info("Altair is not available; showing table only.")
+
+            # Download CSV
+            csv_bytes = corr.to_csv(index=True).encode("utf-8")
+            st.download_button(
+                "Download correlation CSV",
+                data=csv_bytes,
+                file_name="{}_correlation.csv".format(os.path.splitext(sel_file)[0]),
+                mime="text/csv",
+            )
