@@ -1,15 +1,33 @@
 # core/advanced_models.py
+"""
+Advanced MMM post-processing utilities
+Version: 2.1.0
+
+Workflows implemented (no SciPy dependency):
+- breakout_split: re-split one base channel’s impact into selected sub-metrics (no intercept; sum preserved)
+- residual_reattribute: allocate a portion of Base % to new channels; Base % decreases by same total
+- pathway_redistribute: move a share of Channel A’s impact to Channel B; totals preserved
+- apply_decomp_update: apply any of the above updates to a base record’s decomposition
+- _ensure_decomp_from_record_or_recompute: robust decomp if missing in saved JSON
+
+All functions are pure-Pandas/NumPy and compatible with Streamlit Cloud.
+"""
 from __future__ import annotations
-import os, json, re, math, itertools
-from typing import List, Dict, Any, Tuple, Optional
+import os, re, math
+from typing import List, Dict, Any, Optional
 import numpy as np
 import pandas as pd
 
-# Optional: if you have core.modeling it’s fine; not strictly required here.
-try:
-    from core import modeling  # noqa: F401
-except Exception:
-    modeling = None
+__all__ = [
+    "ADV_MODELS_VERSION",
+    "breakout_split",
+    "residual_reattribute",
+    "pathway_redistribute",
+    "apply_decomp_update",
+    "_ensure_decomp_from_record_or_recompute",
+]
+
+ADV_MODELS_VERSION = "2.1.0"
 
 # ---------------------------
 # Basic helpers
@@ -27,9 +45,8 @@ def _feature_series(df: pd.DataFrame, name: str) -> pd.Series:
     if name in df.columns:
         return _to_num(df[name])
     # Sometimes transforms saved as 'metric__tfm', but raw exists:
-    raw = name.replace("__tfm","")
-    if raw in df.columns:
-        return _to_num(df[raw])
+    if name.endswith("__tfm") and name[:-5] in df.columns:
+        return _to_num(df[name[:-5]])
     # last resort: zeros
     return pd.Series(np.zeros(len(df)), index=df.index, name=name)
 
@@ -38,23 +55,11 @@ def _contrib_series(df: pd.DataFrame, coef: Dict[str, float], features: List[str
     out: Dict[str, pd.Series] = {}
     for f in features:
         c = float(coef.get(f, 0.0))
-        x = _feature_series(df, f)
-        out[f] = c * x
+        out[f] = c * _feature_series(df, f)
     return out
 
-def _metrics(y: np.ndarray, yhat: np.ndarray, p: int) -> Dict[str, float]:
-    y = np.asarray(y, float); yhat = np.asarray(yhat, float)
-    n = len(y)
-    resid = y - yhat
-    sse = float(np.sum(resid**2))
-    sst = float(np.sum((y - y.mean())**2)) if n > 0 else 0.0
-    r2 = 1.0 - (sse / sst) if sst > 0 else 0.0
-    rmse = math.sqrt(sse / n) if n > 0 else float("nan")
-    adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / max(n - p - 1, 1)
-    return {"n": int(n), "p": int(p), "r2": float(r2), "adj_r2": float(adj_r2), "rmse": float(rmse)}
-
 # ---------------------------
-# Decomp helper (used by pages & updates)
+# Minimal decomposition (robust fallback)
 # ---------------------------
 def _ensure_decomp_from_record_or_recompute(record: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
     """
@@ -106,7 +111,7 @@ def _ensure_decomp_from_record_or_recompute(record: Dict[str, Any], df: pd.DataF
 def breakout_split(
     df: pd.DataFrame,
     base_record: Dict[str, Any],
-    channel_to_split: str,      # display name, e.g. "PaidSearch"
+    channel_to_split: str,      # display name, e.g. "Paid Search"
     sub_metrics: List[str],     # NOT in base model
 ) -> Dict[str, Any]:
     """
@@ -117,7 +122,7 @@ def breakout_split(
     coef = base_record.get("coef", {}) or {}
     features = [f for f in base_record.get("features", []) or [] if f != "const"]
     # find real feature name for display channel
-    parent_feat = None
+    parent_feat: Optional[str] = None
     for f in features:
         disp = f[:-5] if f.endswith("__tfm") else f
         if disp == channel_to_split:
@@ -215,7 +220,7 @@ def residual_reattribute(
         "base_pct_before": base_pct_before,
         "allocated": allocated,
         "base_pct_after": base_pct_after,
-        "note": "Allocated pp come out of Base % and increase incremental %."
+        "note": "Allocated pp come out of Base % and increase Incremental %."
     }
 
 # ---------------------------
@@ -290,20 +295,18 @@ def apply_decomp_update(
       - residual_reattribute: move % from Base to new channels
       - pathway_redistribute: move % from A to B
     """
-    decomp = _ensure_decomp_from_record_or_recompute(base_record, df)
-    impact = dict(decomp.get("impactable_pct", {}))
-    base_pct = float(decomp.get("base_pct", 0.0))
-    carry_pct = float(decomp.get("carryover_pct", 0.0))
+    d = _ensure_decomp_from_record_or_recompute(base_record, df)
+    impact = dict(d.get("impactable_pct", {}))
+    base_pct = float(d.get("base_pct", 0.0))
+    carry_pct = float(d.get("carryover_pct", 0.0))
 
     t = update.get("type")
 
     if t == "breakout_split":
         parent = update["split_channel"]
         alloc: Dict[str, float] = update.get("allocated", {})
-        # remove parent
         if parent in impact:
             del impact[parent]
-        # add/merge children
         for k, v in alloc.items():
             impact[k] = impact.get(k, 0.0) + float(v)
 
@@ -323,7 +326,7 @@ def apply_decomp_update(
 
     # recompute incremental %
     incr_pct = float(sum(impact.values()))
-    # normalize (keep base+carry fixed)
+    # normalize (keep base+carry fixed) to avoid rounding drift
     total_pct = base_pct + carry_pct + incr_pct
     if abs(total_pct - 100.0) > 0.01 and incr_pct > 0:
         scale = max(0.0, 100.0 - base_pct - carry_pct) / incr_pct
