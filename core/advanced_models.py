@@ -61,27 +61,49 @@ def _contrib_series(df: pd.DataFrame, coef: Dict[str, float], features: List[str
 # ---------------------------
 # Minimal decomposition (robust fallback)
 # ---------------------------
+# core/advanced_models.py — replace this one function
+
 def _ensure_decomp_from_record_or_recompute(record: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
     """
     Ensure 'decomp' exists in result record. If missing, recompute a minimal one:
-      - base_pct from 'const'
+      - base_pct from 'const' share
       - impactable_pct from positive contributions of non-const features
-      - carryover_pct set to 0 (transform metadata not used here)
+      - carryover_pct = 0 (we don't re-derive adstock metadata here)
+    Denominator selection (robust, to avoid blow-ups):
+      1) sum(actual target) if present
+      2) sum(yhat) if present and > 0
+      3) sum(all contributions)
+      4) 1.0 (as a last resort)
     """
-    if isinstance(record.get("decomp"), dict) and "impactable_pct" in record["decomp"]:
-        return record["decomp"]
+    d = record.get("decomp")
+    if isinstance(d, dict) and "impactable_pct" in d:
+        return d
 
     coef = record.get("coef", {}) or {}
     features = record.get("features", []) or []
-    yhat = np.asarray(record.get("yhat", []), float)
-    if yhat.size == 0:
-        yhat = np.zeros(len(df), dtype=float)
 
+    # Build contribution series per feature
     contrib = _contrib_series(df, coef, features)
-    total_pred = float(np.maximum(yhat.sum(), 1e-12))
-    if total_pred <= 0:
-        total_pred = float(sum(s.sum() for s in contrib.values())) or 1.0
 
+    # Denominator candidates
+    # 1) sum of actual target if available
+    total_from_y = None
+    tgt = record.get("target")
+    if tgt and tgt in df.columns:
+        total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
+
+    # 2) sum of yhat if present
+    yhat = np.asarray(record.get("yhat", []), float)
+    total_from_yhat = float(np.nansum(yhat)) if yhat.size > 0 else 0.0
+
+    # 3) sum of all contributions (including const)
+    total_from_contrib = float(sum(float(s.sum()) for s in contrib.values())) if contrib else 0.0
+
+    # Choose denominator (strictly positive)
+    candidates = [t for t in [total_from_y, total_from_yhat, total_from_contrib] if t and t > 0]
+    total_pred = candidates[0] if candidates else 1.0  # never use 1e-12
+
+    # Base and impactable %
     base_sum = float(contrib.get("const", pd.Series(0.0, index=df.index)).sum())
     base_pct = 100.0 * base_sum / total_pred
 
@@ -96,7 +118,20 @@ def _ensure_decomp_from_record_or_recompute(record: Dict[str, Any], df: pd.DataF
         impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * val / total_pred
 
     carry_pct = 0.0
-    incr_pct = max(0.0, 100.0 - base_pct - carry_pct)
+    incr_pct = float(sum(impact_map.values()))
+    # Normalize tiny numerical drift so base + incr ≈ 100
+    total_pct = base_pct + incr_pct + carry_pct
+    if abs(total_pct - 100.0) > 0.1 and incr_pct > 0:
+        scale = max(0.0, 100.0 - base_pct - carry_pct) / incr_pct
+        for k in list(impact_map.keys()):
+            impact_map[k] = impact_map[k] * scale
+        incr_pct = float(sum(impact_map.values()))
+
+    # Round a bit for cleaner UI (optional)
+    base_pct = float(round(base_pct, 6))
+    incr_pct = float(round(incr_pct, 6))
+    carry_pct = float(round(carry_pct, 6))
+    impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
 
     return {
         "base_pct": base_pct,
