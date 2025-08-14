@@ -1,5 +1,5 @@
 # pages/5_Advanced_Models.py
-import os, json, glob, re, importlib
+import os, json, glob, re, importlib.util, pathlib
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -7,20 +7,28 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---- This page’s identity (quick debug badge so you know you’re here) ----
-PAGE_ID = "ADVANCED_MODELS_PAGE_V230"
-
-# ---- Import + hot-reload the core module (so updates are picked up) ----
-from core import advanced_models as am
-importlib.reload(am)
+PAGE_ID = "ADVANCED_MODELS_PAGE_v2_3_0"
 
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
-st.caption(f"Advanced Models core version: **{getattr(am, 'ADV_MODELS_VERSION', 'unknown')}** • Page: `{PAGE_ID}`")
+st.caption(f"Page ID: `{PAGE_ID}`")
 
 DATA_DIR = "data"
 RESULTS_DIR = "results"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# ---------------------------------------------------------------------------------------
+# Force-load *local* core/advanced_models.py by file path (avoids any 'core' name clash)
+# ---------------------------------------------------------------------------------------
+CORE_PATH = pathlib.Path("core/advanced_models.py").resolve()
+if not CORE_PATH.exists():
+    st.error(f"Expected file not found: {CORE_PATH}")
+    st.stop()
+
+_spec = importlib.util.spec_from_file_location("advanced_models_local", CORE_PATH)
+am = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(am)  # type: ignore
+st.caption(f"Loaded advanced_models from: `{getattr(am, '__file__', 'unknown')}` (core version: {getattr(am, 'ADV_MODELS_VERSION', 'unknown')})")
 
 # ---------------------------
 # Helpers
@@ -104,7 +112,7 @@ REQUIRED_FUNCS = [
 ]
 missing = [fn for fn in REQUIRED_FUNCS if not hasattr(am, fn)]
 if missing:
-    st.error(f"`core/advanced_models.py` is missing: {', '.join(missing)}")
+    st.error(f"`advanced_models.py` missing: {', '.join(missing)}\nLoaded from: {getattr(am, '__file__', 'unknown')}")
     st.stop()
 
 # ---------------------------
