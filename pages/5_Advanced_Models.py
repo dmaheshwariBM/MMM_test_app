@@ -7,11 +7,15 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# ---- This page’s identity (quick debug badge so you know you’re here) ----
+PAGE_ID = "ADVANCED_MODELS_PAGE_V230"
+
+# ---- Import + hot-reload the core module (so updates are picked up) ----
 from core import advanced_models as am
-importlib.reload(am)  # pick up latest core
+importlib.reload(am)
 
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
-st.caption(f"Core version: **{getattr(am, 'ADV_MODELS_VERSION', 'unknown')}**")
+st.caption(f"Advanced Models core version: **{getattr(am, 'ADV_MODELS_VERSION', 'unknown')}** • Page: `{PAGE_ID}`")
 
 DATA_DIR = "data"
 RESULTS_DIR = "results"
@@ -19,7 +23,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ---------------------------
-# Helper
+# Helpers
 # ---------------------------
 def _load_results_catalog() -> List[Dict[str, Any]]:
     rows = []
@@ -130,7 +134,7 @@ st.caption(f"Dataset: **{base['dataset']}** • Target: **{base.get('target','?'
 st.info(f"Base % (current): **{float(decomp0.get('base_pct',0)):.2f}%**")
 
 # ---------------------------
-# Tabs
+# Tabs (Advanced Models only)
 # ---------------------------
 tab1, tab2, tab3 = st.tabs(["📊 Breakout split", "➕ Residual (on Base)", "🧩 Pathway redistribution"])
 
