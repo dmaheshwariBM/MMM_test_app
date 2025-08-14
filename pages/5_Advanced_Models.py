@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "ADVANCED_MODELS_PAGE_v2_4_1"
+PAGE_ID = "ADVANCED_MODELS_PAGE_v2_5_0"
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
 st.caption(f"Page ID: `{PAGE_ID}`")
 
@@ -16,18 +16,16 @@ RESULTS_DIR = "results"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# ---- Import core with fallback to file-path load (core stays pure python) ----
+# ---- Import core (pure python) ----
 def _import_advanced_models():
     try:
         from core import advanced_models as am  # type: ignore
         return am
     except Exception:
         pass
-    # fallback: load by path
     core_path = pathlib.Path("core/advanced_models.py").resolve()
     if not core_path.exists():
-        st.error(f"Expected file not found: {core_path}")
-        st.stop()
+        st.error(f"Expected file not found: {core_path}"); st.stop()
     spec = importlib.util.spec_from_file_location("advanced_models_local", core_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -46,8 +44,59 @@ REQUIRED_FUNCS = [
 ]
 missing = [fn for fn in REQUIRED_FUNCS if not hasattr(am, fn)]
 if missing:
-    st.error(f"`advanced_models` missing: {', '.join(missing)}")
-    st.stop()
+    st.error(f"`advanced_models` missing: {', '.join(missing)}"); st.stop()
+
+# ───────── JSON-safe save helpers (same as Results page) ─────────
+def _safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
+
+def _json_ready(obj: Any):
+    import numpy as _np
+    from datetime import datetime as _dt
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, _dt):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(x) for x in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in ("_ts", "_path"):
+                continue
+            out[str(k)] = _json_ready(v)
+        return out
+    if hasattr(obj, "tolist"):
+        try:
+            return obj.tolist()
+        except Exception:
+            pass
+    try:
+        if isinstance(obj, (_np.floating, _np.integer)):
+            return obj.item()
+    except Exception:
+        pass
+    try:
+        return float(obj)
+    except Exception:
+        return str(obj)
+
+def save_result_json(results_dir: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
+    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(results_dir, batch_ts)
+    os.makedirs(out_dir, exist_ok=True)
+    fname = f"{batch_ts}__{_safe(name)}__{_safe(target)}.json"
+    body = {
+        "batch_ts": batch_ts,
+        "name": name,
+        "target": target,
+        "dataset": dataset,
+        **payload
+    }
+    body = _json_ready(body)
+    with open(os.path.join(out_dir, fname), "w") as f:
+        json.dump(body, f, indent=2)
+    return out_dir
 
 # ---------------------------
 # Helpers
@@ -75,36 +124,6 @@ def _load_results_catalog() -> List[Dict[str, Any]]:
 
 def _load_dataset_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(os.path.join(DATA_DIR, name))
-
-def _safe(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
-
-def _persist_record(model_name: str, target: str, dataset: str, record: Dict[str, Any]) -> str:
-    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(RESULTS_DIR, batch_ts)
-    os.makedirs(out_dir, exist_ok=True)
-    fname = f"{batch_ts}__{_safe(model_name)}__{_safe(target)}.json"
-    with open(os.path.join(out_dir, fname), "w") as f:
-        json.dump({**record,
-                   "batch_ts": batch_ts,
-                   "name": model_name,
-                   "target": target,
-                   "dataset": dataset}, f, indent=2)
-    return out_dir
-
-def _overwrite_base(base_name: str, new_decomp: Dict[str, Any]) -> None:
-    for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
-        try:
-            with open(jf, "r") as f:
-                rec = json.load(f)
-            if str(rec.get("name","")).strip().lower() == str(base_name).strip().lower():
-                keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
-                keep["decomp"] = new_decomp
-                with open(jf, "w") as g:
-                    json.dump(keep, g, indent=2)
-                return
-        except Exception:
-            continue
 
 def _render_decomp(decomp: Dict[str, Any]):
     if not decomp:
@@ -149,7 +168,7 @@ st.info(f"Base % (current): **{float(decomp0.get('base_pct',0)):.2f}%**")
 # ---------------------------
 tab1, tab2, tab3 = st.tabs(["📊 Breakout split", "➕ Residual (on Base)", "🧩 Pathway redistribution"])
 
-# ===== Breakout split =====
+# Breakout
 with tab1:
     st.subheader("Breakout split")
     parent = st.selectbox("Channel to split (from base)", options=features_disp)
@@ -167,19 +186,31 @@ with tab1:
             with c1:
                 name_new = st.text_input("Save as name", value=f"{base['name']}__breakout_{parent}")
                 if st.button("Save as new result"):
-                    where = _persist_record(name_new, base.get("target","?"), base["dataset"], {**base, "type": "breakout_split", "decomp": new_decomp})
-                    st.success(f"Saved to `{where}`.")
+                    payload = {**base, "type": "breakout_split", "decomp": new_decomp}
+                    out_dir = save_result_json(RESULTS_DIR, name_new, base.get("target","?"), base["dataset"], payload)
+                    st.success(f"Saved to `{out_dir}`"); st.rerun()
             with c2:
                 if st.button("Update base result"):
-                    _overwrite_base(base["name"], new_decomp)
-                    st.success("Base model updated.")
+                    # overwrite only the decomp of the base record
+                    for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
+                        try:
+                            with open(jf, "r") as f:
+                                rec = json.load(f)
+                            if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
+                                keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
+                                keep["decomp"] = new_decomp
+                                with open(jf, "w") as g:
+                                    json.dump(_json_ready(keep), g, indent=2)
+                                st.success("Base model updated."); st.rerun()
+                        except Exception:
+                            continue
         except Exception as e:
             st.error("Breakout failed."); st.exception(e)
 
-# ===== Residual (on Base) =====
+# Residual
 with tab2:
     st.subheader("Residual re-attribution (regress Base on new channels)")
-    st.caption("Fit the **Base (intercept)** series on selected channels. The **fitted share of Base** is moved from Base% to those channels (split by fitted contributions).")
+    st.caption("Move a fitted share of Base% to selected channels, split by fitted contributions.")
 
     extra = st.multiselect("Channels to explain Base (not in base model)", options=[c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))])
     frac = st.slider("Apply what fraction of the *fitted* Base to reattribute?", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
@@ -204,16 +235,27 @@ with tab2:
             with c1:
                 name_new = st.text_input("Save as name", value=f"{base['name']}__residual_on_base")
                 if st.button("Save as new result", key="save_resid"):
-                    where = _persist_record(name_new, base.get("target","?"), base["dataset"], {**base, "type": "residual_reattribute", "decomp": new_decomp})
-                    st.success(f"Saved to `{where}`.")
+                    payload = {**base, "type": "residual_reattribute", "decomp": new_decomp}
+                    out_dir = save_result_json(RESULTS_DIR, name_new, base.get("target","?"), base["dataset"], payload)
+                    st.success(f"Saved to `{out_dir}`"); st.rerun()
             with c2:
                 if st.button("Update base result", key="upd_resid"):
-                    _overwrite_base(base["name"], new_decomp)
-                    st.success("Base model updated.")
+                    for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
+                        try:
+                            with open(jf, "r") as f:
+                                rec = json.load(f)
+                            if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
+                                keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
+                                keep["decomp"] = new_decomp
+                                with open(jf, "w") as g:
+                                    json.dump(_json_ready(keep), g, indent=2)
+                                st.success("Base model updated."); st.rerun()
+                        except Exception:
+                            continue
         except Exception as e:
             st.error("Residual re-attribution failed."); st.exception(e)
 
-# ===== Pathway redistribution =====
+# Pathway
 with tab3:
     st.subheader("Pathway redistribution")
     if not features_disp:
@@ -239,11 +281,22 @@ with tab3:
                 with c1:
                     name_new = st.text_input("Save as name", value=f"{base['name']}__pathway_{A}_to_{B}")
                     if st.button("Save as new result", key="save_path"):
-                        where = _persist_record(name_new, base.get("target","?"), base["dataset"], {**base, "type": "pathway_redistribute", "decomp": new_decomp})
-                        st.success(f"Saved to `{where}`.")
+                        payload = {**base, "type": "pathway_redistribute", "decomp": new_decomp}
+                        out_dir = save_result_json(RESULTS_DIR, name_new, base.get("target","?"), base["dataset"], payload)
+                        st.success(f"Saved to `{out_dir}`"); st.rerun()
                 with c2:
                     if st.button("Update base result", key="upd_path"):
-                        _overwrite_base(base["name"], new_decomp)
-                        st.success("Base model updated.")
+                        for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
+                            try:
+                                with open(jf, "r") as f:
+                                    rec = json.load(f)
+                                if str(rec.get("name","")).strip().lower() == str(base["name"]).strip().lower():
+                                    keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
+                                    keep["decomp"] = new_decomp
+                                    with open(jf, "w") as g:
+                                        json.dump(_json_ready(keep), g, indent=2)
+                                    st.success("Base model updated."); st.rerun()
+                            except Exception:
+                                continue
             except Exception as e:
                 st.error("Pathway redistribution failed."); st.exception(e)
