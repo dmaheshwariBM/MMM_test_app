@@ -16,7 +16,7 @@ from typing import Dict, Any, List
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Home", layout="wide")
+st.set_page_config(page_title="Marketing Mix Modeling", layout="wide")
 
 PAGE_ID = "HOME_PAGE_v1_4_0"
 st.title("Home")
