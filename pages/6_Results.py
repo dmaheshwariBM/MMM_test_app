@@ -8,16 +8,46 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_6_0"
+PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_7_0"
 
 st.title("📊 Results — Compare, Inspect & Compose")
-st.caption(f"Page ID: `{PAGE_ID}` • Standalone (no core/results.py needed)")
+st.caption(f"Page ID: `{PAGE_ID}` • Robust save/load across writable dirs")
 
 DATA_DIR = "data"
-RESULTS_DIR = "results"
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
-RESULTS_DIR_ABS = os.path.abspath(RESULTS_DIR)
+
+# ───────────────────────── Writable roots ─────────────────────────
+def _abs(p: str) -> str: return os.path.abspath(p)
+
+CANDIDATE_RESULTS_ROOTS = [
+    _abs(os.environ.get("MMM_RESULTS_DIR", "")) if os.environ.get("MMM_RESULTS_DIR") else None,
+    _abs("results"),
+    _abs("/tmp/mmm_results"),
+]
+CANDIDATE_RESULTS_ROOTS = [p for p in CANDIDATE_RESULTS_ROOTS if p]
+
+def _ensure_dir(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        # quick write test
+        testf = os.path.join(path, ".write_test")
+        with open(testf, "w") as f: f.write("ok")
+        os.remove(testf)
+        return True
+    except Exception:
+        return False
+
+def pick_writable_results_root() -> str:
+    for root in CANDIDATE_RESULTS_ROOTS:
+        if _ensure_dir(root):
+            return root
+    # last resort: cwd
+    fallback = _abs("results_fallback")
+    _ensure_dir(fallback)
+    return fallback
+
+RESULTS_ROOT = pick_writable_results_root()
+st.caption(f"Results root: `{RESULTS_ROOT}`")
 
 # ───────────────────────── Utilities ─────────────────────────
 def _safe(s: str) -> str:
@@ -38,31 +68,69 @@ def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
         return pd.to_numeric(df[name[:-5]], errors="coerce").fillna(0.0)
     return pd.Series(np.zeros(len(df)), index=df.index, name=name)
 
-def load_results_catalog(results_dir: str = RESULTS_DIR) -> List[Dict[str, Any]]:
-    """Recursively scan results/**/*.json (any depth)."""
-    rows = []
-    # recursive scan (catches results/*.json and results/*/*.json, etc.)
-    files = sorted(
-        glob.glob(os.path.join(results_dir, "**", "*.json"), recursive=True),
-        reverse=True
-    )
-    for jf in files:
-        try:
-            with open(jf, "r") as f:
-                r = json.load(f)
-            r["_path"] = jf
-            # derive timestamp from payload or file mtime
-            ts = r.get("batch_ts")
-            if ts:
-                try:
-                    r["_ts"] = datetime.strptime(ts, "%Y%m%d_%H%M%S")
-                except Exception:
+def _json_ready(obj: Any):
+    import numpy as _np
+    from datetime import datetime as _dt
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, _dt):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(x) for x in obj]
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in ("_ts", "_path"):  # drop transient fields
+                continue
+            out[str(k)] = _json_ready(v)
+        return out
+    if hasattr(obj, "tolist"):
+        try: return obj.tolist()
+        except Exception: pass
+    try:
+        if isinstance(obj, (_np.floating, _np.integer)):
+            return obj.item()
+    except Exception:
+        pass
+    try:
+        return float(obj)
+    except Exception:
+        return str(obj)
+
+def save_result_json(results_root: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
+    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(results_root, batch_ts)
+    os.makedirs(out_dir, exist_ok=True)
+    fname = f"{batch_ts}__{_safe(name)}__{_safe(target)}.json"
+    body = {"batch_ts": batch_ts, "name": name, "target": target, "dataset": dataset, **payload}
+    body = _json_ready(body)
+    full_path = os.path.join(out_dir, fname)
+    with open(full_path, "w") as f:
+        json.dump(body, f, indent=2)
+    return full_path
+
+def load_results_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
+    """Recursively scan all candidate roots for **/*.json."""
+    rows: List[Dict[str, Any]] = []
+    saw: set[str] = set()
+    for root in results_roots:
+        patt = os.path.join(root, "**", "*.json")
+        files = sorted(glob.glob(patt, recursive=True), reverse=True)
+        for jf in files:
+            if jf in saw: continue
+            try:
+                with open(jf, "r") as f:
+                    r = json.load(f)
+                r["_path"] = jf
+                ts = r.get("batch_ts")
+                if ts:
+                    try: r["_ts"] = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+                    except Exception: r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
+                else:
                     r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
-            else:
-                r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
-            rows.append(r)
-        except Exception:
-            continue
+                rows.append(r); saw.add(jf)
+            except Exception:
+                continue
     rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
     return rows
 
@@ -88,134 +156,48 @@ def ensure_decomp(record: Dict[str, Any]) -> Dict[str, Any]:
     d = record.get("decomp")
     if isinstance(d, dict) and "impactable_pct" in d:
         return normalize_and_round(d)
-
-    dataset = record.get("dataset")
-    features = record.get("features", []) or []
-    coef = record.get("coef", {}) or {}
+    dataset = record.get("dataset"); features = record.get("features", []) or []; coef = record.get("coef", {}) or {}
     yhat = np.asarray(record.get("yhat", []), float)
-
-    if not dataset:
-        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
+    if not dataset: return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
     path = os.path.join(DATA_DIR, dataset)
-    if not os.path.exists(path):
-        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
-
-    try:
-        df = pd.read_csv(path)
-    except Exception:
-        return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
-
+    if not os.path.exists(path): return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
+    try: df = pd.read_csv(path)
+    except Exception: return {"base_pct": np.nan, "carryover_pct": 0.0, "incremental_pct": np.nan, "impactable_pct": {}}
     contrib_sum: Dict[str, float] = {}
-    n = len(df)
-    ik = _intercept_key(coef)
-    if ik is not None:
-        contrib_sum["const"] = float(coef.get(ik, 0.0)) * n
-
+    n = len(df); ik = _intercept_key(coef)
+    if ik is not None: contrib_sum["const"] = float(coef.get(ik, 0.0)) * n
     for f in features:
         if f == "const": continue
-        c = float(coef.get(f, 0.0))
-        x = _to_num_series(df, f)
+        c = float(coef.get(f, 0.0)); x = _to_num_series(df, f)
         contrib_sum[f] = float((c * x).clip(lower=0.0).sum())
-
-    total_from_y = None
-    tgt = record.get("target")
-    if tgt and tgt in df.columns:
-        total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
+    total_from_y = None; tgt = record.get("target")
+    if tgt and tgt in df.columns: total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
     total_from_yhat = float(np.nansum(yhat)) if yhat.size > 0 else 0.0
     total_from_contrib = float(sum(contrib_sum.values())) if contrib_sum else 0.0
     candidates = [t for t in (total_from_y, total_from_yhat, total_from_contrib) if t and t > 0]
     total_pred = candidates[0] if candidates else 1.0
-
-    base_sum = float(contrib_sum.get("const", 0.0))
-    base_pct = 100.0 * base_sum / total_pred
-
+    base_sum = float(contrib_sum.get("const", 0.0)); base_pct = 100.0 * base_sum / total_pred
     impact_map: Dict[str, float] = {}
     for f, s in contrib_sum.items():
         if f == "const": continue
         disp = f[:-5] if f.endswith("__tfm") else f
-        if s > 0:
-            impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
-
-    return normalize_and_round({
-        "base_pct": base_pct,
-        "carryover_pct": 0.0,
-        "incremental_pct": float(sum(impact_map.values())),
-        "impactable_pct": impact_map
-    })
+        if s > 0: impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * s / total_pred
+    return normalize_and_round({"base_pct": base_pct, "carryover_pct": 0.0, "incremental_pct": float(sum(impact_map.values())), "impactable_pct": impact_map})
 
 def metrics_row(r: Dict[str, Any]) -> Dict[str, Any]:
     m = r.get("metrics", {}) or {}
     return {"R²": m.get("r2"), "Adj R²": m.get("adj_r2"), "RMSE": m.get("rmse"), "n": m.get("n"), "p": m.get("p")}
 
 def _short_type(t: str) -> str:
-    return {
-        "base": "base",
-        "breakout_split": "breakout",
-        "residual_reattribute": "residual",
-        "pathway_redistribute": "pathway",
-        "composite": "composite",
-    }.get(str(t), str(t) or "base")
+    return {"base": "base","breakout_split": "breakout","residual_reattribute": "residual","pathway_redistribute": "pathway","composite": "composite",}.get(str(t), str(t) or "base")
 
 def fmt_label(r: Dict[str, Any]) -> str:
-    nm = r.get("name","(unnamed)")
-    tp = _short_type(r.get("type","base"))
-    tgt = r.get("target","?")
-    ts = r.get("_ts")
+    nm = r.get("name","(unnamed)"); tp = _short_type(r.get("type","base")); tgt = r.get("target","?"); ts = r.get("_ts")
     when = ts.strftime("%Y-%m-%d %H:%M:%S") if ts else "—"
     return f"{nm} • {tp} • {tgt} • {when}"
 
 def _load_csv(name: str) -> pd.DataFrame:
     return pd.read_csv(os.path.join(DATA_DIR, name))
-
-# JSON-safe serializer (drops _ts/_path, converts numpy/datetime)
-def _json_ready(obj: Any):
-    import numpy as _np
-    from datetime import datetime as _dt
-    if obj is None or isinstance(obj, (bool, int, float, str)):
-        return obj
-    if isinstance(obj, _dt):
-        return obj.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(obj, (list, tuple)):
-        return [_json_ready(x) for x in obj]
-    if isinstance(obj, dict):
-        out = {}
-        for k, v in obj.items():
-            if k in ("_ts", "_path"):  # drop transient fields
-                continue
-            out[str(k)] = _json_ready(v)
-        return out
-    if hasattr(obj, "tolist"):
-        try:
-            return obj.tolist()
-        except Exception:
-            pass
-    try:
-        if isinstance(obj, (_np.floating, _np.integer)):
-            return obj.item()
-    except Exception:
-        pass
-    try:
-        return float(obj)
-    except Exception:
-        return str(obj)
-
-def save_result_json(results_dir: str, name: str, target: str, dataset: str, payload: Dict[str, Any]) -> str:
-    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(results_dir, batch_ts)
-    os.makedirs(out_dir, exist_ok=True)
-    fname = f"{batch_ts}__{_safe(name)}__{_safe(target)}.json"
-    body = {
-        "batch_ts": batch_ts,
-        "name": name,
-        "target": target,
-        "dataset": dataset,
-        **payload
-    }
-    body = _json_ready(body)
-    full_path = os.path.join(out_dir, fname)
-    with open(full_path, "w") as f:
-        json.dump(body, f, indent=2)
-    return full_path  # return full file path now
 
 # ───────────────────── Import advanced core (for composer) ─────────────────────
 def _import_advanced_models():
@@ -247,12 +229,12 @@ with cols_top[0]:
 with cols_top[1]:
     show_diag = st.toggle("Diagnostics", value=False, help="Show file scan details")
 with cols_top[2]:
-    st.caption(f"Scanning: `{RESULTS_DIR_ABS}`")
+    st.caption("Scanning roots: " + ", ".join(f"`{r}`" for r in CANDIDATE_RESULTS_ROOTS))
 
 # ───────────────────── Load catalog ─────────────────────
-catalog = load_results_catalog(RESULTS_DIR)
+catalog = load_results_catalog(CANDIDATE_RESULTS_ROOTS)
 if show_diag:
-    st.info(f"Found {len(catalog)} saved JSON(s) under `{RESULTS_DIR_ABS}/**/*.json`")
+    st.info(f"Found {len(catalog)} saved JSON(s).")
     for r in catalog[:25]:
         st.write("•", r.get("_path"))
 
@@ -370,22 +352,6 @@ with tab_inspect:
 
 # ==== Compose adjustments ====
 with tab_compose:
-    # Import advanced core (optional for composition)
-    def _import_advanced_models():
-        try:
-            from core import advanced_models as am  # type: ignore
-            return am
-        except Exception:
-            pass
-        core_path = pathlib.Path("core/advanced_models.py").resolve()
-        if not core_path.exists():
-            return None
-        spec = importlib.util.spec_from_file_location("advanced_models_local", core_path)
-        module = importlib.util.module_from_spec(spec)
-        assert spec.loader is not None
-        spec.loader.exec_module(module)  # type: ignore
-        return module
-
     am = _import_advanced_models()
     if am is None:
         st.warning("Install/restore `core/advanced_models.py` to use the composition workbench.")
@@ -396,12 +362,9 @@ with tab_compose:
     base = catalog[k]
     st.caption(f"Dataset: **{base.get('dataset','?')}** • Target: **{base.get('target','?')}**")
 
-    # session: pipeline of operations
     ops_key = "compose_ops"
-    if ops_key not in st.session_state:
-        st.session_state[ops_key] = []
+    if ops_key not in st.session_state: st.session_state[ops_key] = []
 
-    # load dataset + derive channel/feature lists
     try:
         df_base = _load_csv(base["dataset"])
     except Exception as e:
@@ -414,29 +377,22 @@ with tab_compose:
     numeric_cols = [c for c in df_base.columns if pd.api.types.is_numeric_dtype(df_base[c])]
     not_in_base = [c for c in numeric_cols if (c not in base_set and not c.startswith("_tfm_"))]
 
-    st.markdown("##### Add operations")
     cB, cR, cP = st.columns(3)
-
     with cB:
         st.write("**Breakout split**")
         parent = st.selectbox("Parent channel", options=features_disp, key="co_parent")
         subs = st.multiselect("Sub-metrics", options=not_in_base, key="co_subs")
-        if st.button("➕ Add Breakout"):
-            st.session_state[ops_key].append({"type":"breakout_split","parent": parent,"subs": subs})
-
+        if st.button("➕ Add Breakout"): st.session_state[ops_key].append({"type":"breakout_split","parent": parent,"subs": subs})
     with cR:
         st.write("**Residual (on Base)**")
         extras = st.multiselect("Explain Base with", options=not_in_base, key="co_extras")
         frac = st.slider("Fraction of fitted Base", 0.1, 1.0, 1.0, 0.1, key="co_frac")
-        if st.button("➕ Add Residual"):
-            st.session_state[ops_key].append({"type":"residual_reattribute","extras": extras,"fraction": float(frac)})
-
+        if st.button("➕ Add Residual"): st.session_state[ops_key].append({"type":"residual_reattribute","extras": extras,"fraction": float(frac)})
     with cP:
         st.write("**Pathway**")
         A = st.selectbox("From (A)", options=features_disp, key="co_A")
         B = st.selectbox("To (B)", options=[c for c in features_disp if c != A], key="co_B")
-        if st.button("➕ Add Pathway"):
-            st.session_state[ops_key].append({"type":"pathway_redistribute","A": A,"B": B})
+        if st.button("➕ Add Pathway"): st.session_state[ops_key].append({"type":"pathway_redistribute","A": A,"B": B})
 
     st.divider()
     st.markdown("##### Pipeline")
@@ -452,26 +408,19 @@ with tab_compose:
             else:
                 pretty.append({"#": idx, "Type": "pathway", "A→B": f"{op['A']}→{op['B']}"})
         st.dataframe(pd.DataFrame(pretty), use_container_width=True)
-
         c1, c2, c3 = st.columns(3)
         with c1:
-            if st.button("⟲ Clear all"):
-                st.session_state[ops_key] = []
-                st.rerun()
+            if st.button("⟲ Clear all"): st.session_state[ops_key] = []; st.rerun()
         with c2:
             rm_idx = st.number_input("Remove step #", min_value=1, max_value=len(st.session_state[ops_key]), value=1, step=1)
         with c3:
-            if st.button("🗑 Remove step"):
-                st.session_state[ops_key].pop(int(rm_idx)-1)
-                st.rerun()
+            if st.button("🗑 Remove step"): st.session_state[ops_key].pop(int(rm_idx)-1); st.rerun()
 
     st.divider()
     if st.button("▶ Preview composed result", type="primary"):
         try:
             rec = dict(base)
-            current_decomp = am._ensure_decomp_from_record_or_recompute(rec, df_base)
-            rec["decomp"] = current_decomp
-
+            current_decomp = am._ensure_decomp_from_record_or_recompute(rec, df_base); rec["decomp"] = current_decomp
             for op in st.session_state[ops_key]:
                 if op["type"] == "breakout_split":
                     out = am.breakout_split(df=df_base, base_record=rec, channel_to_split=op["parent"], sub_metrics=op["subs"])
@@ -479,8 +428,7 @@ with tab_compose:
                     out = am.residual_reattribute(df=df_base, base_record=rec, extra_channels=op["extras"], fraction=float(op["fraction"]))
                 else:
                     out = am.pathway_redistribute(df=df_base, base_record=rec, channel_A=op["A"], channel_B=op["B"])
-                current_decomp = am.apply_decomp_update(rec, df_base, out)
-                rec["decomp"] = current_decomp
+                current_decomp = am.apply_decomp_update(rec, df_base, out); rec["decomp"] = current_decomp
 
             st.success("Composed result preview")
             d = current_decomp
@@ -491,8 +439,7 @@ with tab_compose:
             imp = d.get("impactable_pct", {})
             if imp:
                 dfv = pd.DataFrame({"Channel": list(imp.keys()), "Impactable %": list(imp.values())}).set_index("Channel")
-                st.bar_chart(dfv)
-                st.dataframe(dfv, use_container_width=True)
+                st.bar_chart(dfv); st.dataframe(dfv, use_container_width=True)
 
             st.markdown("##### Save / Update / Send to Budget")
             cL, cM, cR = st.columns(3)
@@ -508,7 +455,7 @@ with tab_compose:
                         "yhat": base.get("yhat", []),
                         "features": base.get("features", []),
                     }
-                    saved_file = save_result_json(RESULTS_DIR, nm, base.get("target","?"), base.get("dataset","?"), payload)
+                    saved_file = save_result_json(RESULTS_ROOT, nm, base.get("target","?"), base.get("dataset","?"), payload)
                     st.success(f"Saved: `{saved_file}`")
                     st.rerun()
             with cM:
@@ -528,21 +475,15 @@ with tab_compose:
                     st.success("Preview sent to Budget Optimization.")
             with cR:
                 if st.button("✏ Update base result"):
-                    # overwrite only the decomp in the base record file
-                    for jf in glob.glob(os.path.join(RESULTS_DIR, "**", "*.json"), recursive=True):
+                    for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                         try:
-                            with open(jf, "r") as f:
-                                rec0 = json.load(f)
+                            with open(jf, "r") as f: rec0 = json.load(f)
                             if str(rec0.get("name","")).strip().lower() == str(base.get("name","")).strip().lower():
                                 keep = {k: rec0.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = current_decomp
-                                with open(jf, "w") as g:
-                                    json.dump(_json_ready(keep), g, indent=2)
-                                st.success("Base model updated.")
-                                st.rerun()
-                                break
+                                with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
+                                st.success("Base model updated."); st.rerun(); break
                         except Exception:
                             continue
         except Exception as e:
-            st.error("Composition failed.")
-            st.exception(e)
+            st.error("Composition failed."); st.exception(e)
