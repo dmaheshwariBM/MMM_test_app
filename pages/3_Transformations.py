@@ -1,8 +1,8 @@
 # pages/3_Transformations.py
-# v3.2.0  ASCII-only. Robust dataset picker, per-metric transform UI, preview, validate, save.
+# v3.2.1  Robust dataset picker, full per-metric transform UI, preview, validate, save.
 
 import os
-from datetime import datetime, date
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 
 import numpy as np
@@ -11,18 +11,28 @@ import streamlit as st
 
 from core import transforms as T
 
-PAGE_ID = "TRANSFORMATIONS_PAGE_v3_2_0"
+PAGE_ID = "TRANSFORMATIONS_PAGE_v3_2_1"
 st.title("Transformations")
 st.caption("Page ID: {}".format(PAGE_ID))
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Persisted cross-page banners
+# Cross-page banners
 if st.session_state.get("last_saved_path"):
     st.success("Saved: {}".format(st.session_state["last_saved_path"]))
 if st.session_state.get("last_save_error"):
     st.error(st.session_state["last_save_error"])
+
+# --------- Sanity check on core API (prevents silent AttributeError) ---------
+_required = [
+    "suggest_transform_type", "suggest_k_for_log", "suggest_k_for_negexp",
+    "suggest_adstock_decay", "apply_pipeline", "apply_many", "adstock_finite"
+]
+_missing = [fn for fn in _required if not hasattr(T, fn)]
+if _missing:
+    st.error("core/transforms.py is out of date. Missing: {}".format(", ".join(_missing)))
+    st.stop()
 
 # ---------------- Dataset picker (CSV + XLSX with sheet) ----------------
 
@@ -89,17 +99,16 @@ except Exception as e:
 
 st.caption("Loaded: data/{}".format(dataset_name) + (f" • sheet: {excel_sheet}" if excel_sheet else ""))
 
-# ---------------- Role columns: time / id / segment / target ----------------
+# ---------------- Roles & time window ----------------
 
 st.subheader("Roles & window")
 
-# Detect datetime-like columns
+# detect parseable datelike columns
 date_like = []
 for c in df.columns:
     if pd.api.types.is_datetime64_any_dtype(df[c]):
         date_like.append(c)
     else:
-        # try parse a sample
         try:
             pd.to_datetime(df[c].head(20), errors="raise")
             date_like.append(c)
@@ -110,7 +119,6 @@ c1, c2, c3, c4 = st.columns(4)
 with c1:
     time_col = st.selectbox("Time column (optional)", options=["(none)"] + date_like, index=0)
     if time_col != "(none)":
-        # Coerce full column to datetime safely
         df["_tfm_time"] = pd.to_datetime(df[time_col], errors="coerce")
     else:
         df["_tfm_time"] = pd.NaT
@@ -122,16 +130,13 @@ with c3:
     seg_col = st.selectbox("Segment column (optional)", options=["(none)"] + list(df.columns), index=0)
 
 with c4:
-    # target is used for reference only here
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     tgt = st.selectbox("Target column (for reference)", options=["(none)"] + numeric_cols, index=0)
 
-# Time window limited to available data
 if time_col != "(none)":
     valid_times = df["_tfm_time"].dropna()
     if len(valid_times) == 0:
         st.warning("Selected time column has no parseable dates; window controls disabled.")
-        start_dt, end_dt = None, None
     else:
         dt_min = valid_times.min().date()
         dt_max = valid_times.max().date()
@@ -142,15 +147,12 @@ if time_col != "(none)":
             max_value=dt_max
         )
         if isinstance(start_dt, (list, tuple)):
-            # Streamlit older versions sometimes return tuple
             start_dt, end_dt = start_dt[0], start_dt[1]
         mask = (df["_tfm_time"].dt.date >= start_dt) & (df["_tfm_time"].dt.date <= end_dt)
         df = df.loc[mask].reset_index(drop=True)
         st.caption("Filtered rows: {} ({} to {})".format(len(df), start_dt, end_dt))
-else:
-    start_dt, end_dt = None, None
 
-# ---------------- Select metrics to transform ----------------
+# ---------------- Metrics to transform ----------------
 
 excluded = set()
 for c in (id_col, seg_col, tgt, "_tfm_time"):
@@ -162,7 +164,6 @@ if not metrics_all:
     st.info("No numeric metrics available for transformation in this window.")
     st.stop()
 
-# Remember selection across reruns per dataset
 cfg_key = f"TFM_CFG__{dataset_name}__{excel_sheet or ''}"
 if cfg_key not in st.session_state:
     st.session_state[cfg_key] = {}
@@ -170,22 +171,18 @@ if cfg_key not in st.session_state:
 st.subheader("Configure transformations")
 sel_metrics = st.multiselect("Metrics to transform", options=metrics_all, default=metrics_all[:min(6, len(metrics_all))])
 
-# Explain transformations (hover by reading)
+# Reference: maths
 with st.expander("Reference: transformation maths", expanded=False):
     st.markdown(
         """
-        - **Log**:  \\( y = \\log(1 + kx) \\).  Use for right-skewed metrics.  *k* scales input.
-        - **Negative exponential**:  \\( y = \\beta (1 - e^{-kx}) \\).  Saturating response.
-        - **Negative exponential with cannibalization**: same as above, then multiplied by \\( (1 - \\gamma\\,p) \\),
-          where *p* is a [0,1] normalization of a selected **cannibalization pool** (other channels). \\(\\gamma\\in[0,1]\\).
-        - **Adstock** (finite):  \\( y_t = x_t + r x_{t-1} + r^2 x_{t-2} + \\dots + r^L x_{t-L} \\) with
-          lag *L* and decay \\(r\\in[0,1]\\).
-        - **Order**: choose *Transform → Adstock* or *Adstock → Transform* per metric.
-        - **Scaling**: *None*, *Min–Max [0,1]*, or *Z-score*.
+        - **Log**:  y = log(1 + kx).  k scales input.
+        - **Negative exponential**:  y = beta * (1 - exp(-k x)).
+        - **Negative exponential with cannibalization**: same as above, times (1 - gamma * pool_norm).
+        - **Adstock** (finite):  y_t = x_t + r x_{t-1} + ... + r^L x_{t-L}.
+        - **Order**: Transform → Adstock, or Adstock → Transform.
+        - **Scaling**: None, Min–Max [0,1], or Z-score.
         """
     )
-
-# ---------------- Per-metric controls (stable keys, suggestions) ----------------
 
 def _metric_defaults(s: pd.Series) -> Dict[str, Any]:
     tfm = T.suggest_transform_type(s)
@@ -207,20 +204,19 @@ def _metric_defaults(s: pd.Series) -> Dict[str, Any]:
         "lag": 0,
         "adstock": round(float(T.suggest_adstock_decay(s)), 3),
         "scaling": "none",
-        "cannibal_pool": [],  # list of columns
+        "cannibal_pool": [],
     }
 
-# Ensure config entries exist for selected metrics
+# ensure defaults exist
 for m in sel_metrics:
     if m not in st.session_state[cfg_key]:
         st.session_state[cfg_key][m] = _metric_defaults(df[m])
 
-# UI form to avoid mid-typing reruns
+# Use a form to avoid flicker while typing
 with st.form("tfm_form", clear_on_submit=False):
     for m in sel_metrics:
         conf = st.session_state[cfg_key][m]
         with st.expander(f"{m}", expanded=False):
-            # row 1: transformation choice and params (conditional)
             r1c1, r1c2, r1c3, r1c4 = st.columns([1.5, 1, 1, 1])
             conf["transform"] = r1c1.selectbox(
                 "Transform",
@@ -230,28 +226,24 @@ with st.form("tfm_form", clear_on_submit=False):
             )
             if conf["transform"] == "log":
                 conf["k"] = r1c2.number_input("k (log)", min_value=1e-12, value=float(conf.get("k",1.0)), step=1e-3, format="%.6f", key=f"{dataset_name}__{m}__klog")
-                r1c3.caption("beta not used for log")
-                r1c4.caption("gamma not used for log")
+                r1c3.caption("beta n/a")
+                r1c4.caption("gamma n/a")
             elif conf["transform"] == "negexp":
                 conf["k"] = r1c2.number_input("k (negexp)", min_value=0.0, value=float(conf.get("k",0.01)), step=1e-3, format="%.6f", key=f"{dataset_name}__{m}__kneg")
                 conf["beta"] = r1c3.number_input("beta", min_value=0.0, value=float(conf.get("beta",1.0)), step=0.1, format="%.3f", key=f"{dataset_name}__{m}__beta")
-                r1c4.caption("gamma not used")
+                r1c4.caption("gamma n/a")
             elif conf["transform"] == "negexp_cann":
                 conf["k"] = r1c2.number_input("k (negexp)", min_value=0.0, value=float(conf.get("k",0.01)), step=1e-3, format="%.6f", key=f"{dataset_name}__{m}__knegc")
                 conf["beta"] = r1c3.number_input("beta", min_value=0.0, value=float(conf.get("beta",1.0)), step=0.1, format="%.3f", key=f"{dataset_name}__{m}__betac")
                 conf["gamma"] = r1c4.number_input("gamma (0..1)", min_value=0.0, max_value=1.0, value=float(conf.get("gamma",0.0)), step=0.05, format="%.2f", key=f"{dataset_name}__{m}__gammac")
-                # choose cannibal pool (exclude self)
                 pool_opts = [c for c in metrics_all if c != m]
                 conf["cannibal_pool"] = st.multiselect(
                     "Cannibalization pool (optional)", options=pool_opts, default=conf.get("cannibal_pool", []),
                     key=f"{dataset_name}__{m}__pool"
                 )
             else:
-                r1c2.caption("no params")
-                r1c3.caption("no params")
-                r1c4.caption("no params")
+                r1c2.caption("no params"); r1c3.caption("no params"); r1c4.caption("no params")
 
-            # row 2: order / lag / adstock / scaling
             r2c1, r2c2, r2c3, r2c4 = st.columns([1.3, 1, 1, 1])
             conf["order"] = r2c1.selectbox(
                 "Order",
@@ -268,12 +260,12 @@ with st.form("tfm_form", clear_on_submit=False):
                 key=f"{dataset_name}__{m}__scaling"
             )
 
-            # row 3: suggestions + single-metric preview
             r3c1, r3c2 = st.columns([1, 2])
             if r3c1.button("Apply suggested", key=f"{dataset_name}__{m}__suggest"):
-                st.session_state[cfg_key][m] = _metric_defaults(df[m])
-
-            # preview: compute on current config
+                st.session_state[cfg_key][m] = {
+                    **_metric_defaults(df[m]),
+                    "cannibal_pool": conf.get("cannibal_pool", [])
+                }
             if r3c2.button("Preview", key=f"{dataset_name}__{m}__preview"):
                 params = st.session_state[cfg_key][m]
                 y = T.apply_pipeline(df, m, params, params.get("cannibal_pool", []))
@@ -281,7 +273,6 @@ with st.form("tfm_form", clear_on_submit=False):
                 st.line_chart(prev[[m, m+"__tfm_preview"]])
                 st.dataframe(prev.head(50), use_container_width=True)
 
-    # Submit form to persist the edited configs in session state
     submitted = st.form_submit_button("Update configuration (keeps values)")
     if submitted:
         st.success("Configuration updated.")
@@ -302,15 +293,13 @@ cV, cP = st.columns(2)
 with cV:
     if st.button("Validate"):
         issues = []
-        # ensure all selected metrics exist and numeric; params bounds
         for m, p in config_map.items():
             if m not in df.columns:
-                issues.append(f"{m}: not in dataframe.")
-                continue
+                issues.append(f"{m}: not in dataframe."); continue
             if not pd.api.types.is_numeric_dtype(df[m]):
                 issues.append(f"{m}: not numeric.")
             if p.get("transform") in ("negexp", "negexp_cann") and float(p.get("k",0.0)) < 0:
-                issues.append(f"{m}: k must be >= 0 for negexp.")
+                issues.append(f"{m}: k must be >= 0.")
             if p.get("transform") in ("negexp", "negexp_cann") and float(p.get("beta",0.0)) < 0:
                 issues.append(f"{m}: beta must be >= 0.")
             ad = float(p.get("adstock", 0.0))
@@ -320,9 +309,7 @@ with cV:
             if lag < 0:
                 issues.append(f"{m}: lag must be >= 0.")
         if issues:
-            st.error("Validation found issues:")
-            for msg in issues:
-                st.write("- " + msg)
+            st.error("Validation found issues:"); [st.write("- " + msg) for msg in issues]
         else:
             st.success("Validation passed.")
 
@@ -330,11 +317,10 @@ with cP:
     if st.button("Preview transformed table"):
         try:
             cannib_pools = {m: config_map[m].get("cannibal_pool", []) for m in sel_metrics}
-            out = T.apply_many(df, config_map, cannib_pools=cannib_pools, suffix="__tfm")
+            out = T.apply_many(df, config_map, cannibal_pools=cannib_pools, suffix="__tfm")
             cols = []
             for m in sel_metrics:
-                cols.append(m)
-                cols.append(m + "__tfm")
+                cols.append(m); cols.append(m + "__tfm")
             st.dataframe(out[cols].head(100), use_container_width=True)
         except Exception as e:
             st.error("Preview failed: {}".format(e))
