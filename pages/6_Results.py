@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_5_0"
+PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_6_0"
 
 st.title("📊 Results — Compare, Inspect & Compose")
 st.caption(f"Page ID: `{PAGE_ID}` • Standalone (no core/results.py needed)")
@@ -17,6 +17,7 @@ DATA_DIR = "data"
 RESULTS_DIR = "results"
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
+RESULTS_DIR_ABS = os.path.abspath(RESULTS_DIR)
 
 # ───────────────────────── Utilities ─────────────────────────
 def _safe(s: str) -> str:
@@ -38,23 +39,30 @@ def _to_num_series(df: pd.DataFrame, name: str) -> pd.Series:
     return pd.Series(np.zeros(len(df)), index=df.index, name=name)
 
 def load_results_catalog(results_dir: str = RESULTS_DIR) -> List[Dict[str, Any]]:
+    """Recursively scan results/**/*.json (any depth)."""
     rows = []
-    batches = sorted(glob.glob(os.path.join(results_dir, "*")), reverse=True)
-    for b in batches:
-        for jf in sorted(glob.glob(os.path.join(b, "*.json")), reverse=True):
-            try:
-                with open(jf, "r") as f:
-                    r = json.load(f)
-                r["_path"] = jf
-                r["_batch"] = os.path.basename(b)
-                ts = r.get("batch_ts") or os.path.basename(b)
+    # recursive scan (catches results/*.json and results/*/*.json, etc.)
+    files = sorted(
+        glob.glob(os.path.join(results_dir, "**", "*.json"), recursive=True),
+        reverse=True
+    )
+    for jf in files:
+        try:
+            with open(jf, "r") as f:
+                r = json.load(f)
+            r["_path"] = jf
+            # derive timestamp from payload or file mtime
+            ts = r.get("batch_ts")
+            if ts:
                 try:
                     r["_ts"] = datetime.strptime(ts, "%Y%m%d_%H%M%S")
                 except Exception:
                     r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
-                rows.append(r)
-            except Exception:
-                continue
+            else:
+                r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
+            rows.append(r)
+        except Exception:
+            continue
     rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
     return rows
 
@@ -181,13 +189,11 @@ def _json_ready(obj: Any):
             return obj.tolist()
         except Exception:
             pass
-    # numpy scalar?
     try:
         if isinstance(obj, (_np.floating, _np.integer)):
             return obj.item()
     except Exception:
         pass
-    # fallback
     try:
         return float(obj)
     except Exception:
@@ -206,9 +212,10 @@ def save_result_json(results_dir: str, name: str, target: str, dataset: str, pay
         **payload
     }
     body = _json_ready(body)
-    with open(os.path.join(out_dir, fname), "w") as f:
+    full_path = os.path.join(out_dir, fname)
+    with open(full_path, "w") as f:
         json.dump(body, f, indent=2)
-    return out_dir
+    return full_path  # return full file path now
 
 # ───────────────────── Import advanced core (for composer) ─────────────────────
 def _import_advanced_models():
@@ -233,18 +240,20 @@ else:
     st.caption(f"Advanced core loaded from: `{getattr(am, '__file__', 'unknown')}` (v {getattr(am, 'ADV_MODELS_VERSION','?')})")
 
 # ───────────────────── Top actions ─────────────────────
-cols_top = st.columns([1,1,4])
+cols_top = st.columns([1,2,4])
 with cols_top[0]:
     if st.button("🔄 Refresh list"):
         st.rerun()
 with cols_top[1]:
-    show_diag = st.toggle("Diagnostics", value=False, help="Show raw files found under /results")
+    show_diag = st.toggle("Diagnostics", value=False, help="Show file scan details")
+with cols_top[2]:
+    st.caption(f"Scanning: `{RESULTS_DIR_ABS}`")
 
 # ───────────────────── Load catalog ─────────────────────
 catalog = load_results_catalog(RESULTS_DIR)
 if show_diag:
-    st.info(f"Found {len(catalog)} saved JSONs under `{RESULTS_DIR}/**/*.json`")
-    for r in catalog[:15]:
+    st.info(f"Found {len(catalog)} saved JSON(s) under `{RESULTS_DIR_ABS}/**/*.json`")
+    for r in catalog[:25]:
         st.write("•", r.get("_path"))
 
 if not catalog:
@@ -361,6 +370,23 @@ with tab_inspect:
 
 # ==== Compose adjustments ====
 with tab_compose:
+    # Import advanced core (optional for composition)
+    def _import_advanced_models():
+        try:
+            from core import advanced_models as am  # type: ignore
+            return am
+        except Exception:
+            pass
+        core_path = pathlib.Path("core/advanced_models.py").resolve()
+        if not core_path.exists():
+            return None
+        spec = importlib.util.spec_from_file_location("advanced_models_local", core_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)  # type: ignore
+        return module
+
+    am = _import_advanced_models()
     if am is None:
         st.warning("Install/restore `core/advanced_models.py` to use the composition workbench.")
         st.stop()
@@ -477,17 +503,14 @@ with tab_compose:
                         "type": "composite",
                         "pipeline": st.session_state[ops_key],
                         "decomp": current_decomp,
-                        # carry over useful context for downstream pages
                         "metrics": base.get("metrics", {}),
                         "coef": base.get("coef", {}),
                         "yhat": base.get("yhat", []),
                         "features": base.get("features", []),
                     }
-                    out_dir = save_result_json(
-                        RESULTS_DIR, nm, base.get("target","?"), base.get("dataset","?"), payload
-                    )
-                    st.success(f"Saved to `{out_dir}`")
-                    st.rerun()  # ensure it appears immediately in lists
+                    saved_file = save_result_json(RESULTS_DIR, nm, base.get("target","?"), base.get("dataset","?"), payload)
+                    st.success(f"Saved: `{saved_file}`")
+                    st.rerun()
             with cM:
                 if st.button("📤 Send PREVIEW to Budget Optimization"):
                     preview_skinny = [{
@@ -506,7 +529,7 @@ with tab_compose:
             with cR:
                 if st.button("✏ Update base result"):
                     # overwrite only the decomp in the base record file
-                    for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
+                    for jf in glob.glob(os.path.join(RESULTS_DIR, "**", "*.json"), recursive=True):
                         try:
                             with open(jf, "r") as f:
                                 rec0 = json.load(f)
