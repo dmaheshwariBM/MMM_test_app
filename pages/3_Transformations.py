@@ -1,17 +1,20 @@
 # pages/3_Transformations.py
-# v3.3.0  Table-style config (no forms), robust picker, preview, validate, save.
+# v3.4.0  Stable (form-based) Transformations editor:
+# - CSV/XLSX picker (with sheet + Refresh)
+# - Roles & time window clamped to available dates
+# - Per-metric config inside a form (NO reruns until you click "Submit changes")
+# - Conditional params per transform type + layman tooltips
+# - Validate, Preview metric, Preview table, Apply & Save to data/<base>__tfm.csv
 
 import os
-from datetime import datetime
 from typing import Dict, Any, List
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
 from core import transforms as T
 
-PAGE_ID = "TRANSFORMATIONS_PAGE_v3_3_0"
+PAGE_ID = "TRANSFORMATIONS_PAGE_v3_4_0"
 st.title("Transformations")
 st.caption(f"Page ID: {PAGE_ID}")
 
@@ -114,18 +117,26 @@ for c in df.columns:
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
-    time_col = st.selectbox("Time column (optional)", options=["(none)"] + date_like, index=0)
+    time_col = st.selectbox(
+        "Time column (optional)",
+        options=["(none)"] + date_like,
+        index=0,
+        help="If present, we use it to filter your data to a valid time window only."
+    )
     if time_col != "(none)":
         df["_tfm_time"] = pd.to_datetime(df[time_col], errors="coerce")
     else:
         df["_tfm_time"] = pd.NaT
 with c2:
-    id_col = st.selectbox("ID column (optional)", options=["(none)"] + list(df.columns), index=0)
+    id_col = st.selectbox("ID column (optional)", options=["(none)"] + list(df.columns), index=0,
+                          help="A unique identifier per row (e.g., HCP ID). Not transformed.")
 with c3:
-    seg_col = st.selectbox("Segment column (optional)", options=["(none)"] + list(df.columns), index=0)
+    seg_col = st.selectbox("Segment column (optional)", options=["(none)"] + list(df.columns), index=0,
+                           help="Optional group label column; excluded from transformations.")
 with c4:
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    tgt = st.selectbox("Target column (for reference)", options=["(none)"] + numeric_cols, index=0)
+    tgt = st.selectbox("Target column (for reference)", options=["(none)"] + numeric_cols, index=0,
+                       help="The dependent variable you will model later; excluded from transformations.")
 
 # Clamp time window to available data
 if time_col != "(none)":
@@ -135,8 +146,9 @@ if time_col != "(none)":
     else:
         dt_min = valid_times.min().date()
         dt_max = valid_times.max().date()
-        start_dt, end_dt = st.date_input("Time window", value=(dt_min, dt_max), min_value=dt_min, max_value=dt_max)
-        if isinstance(start_dt, (list, tuple)):  # streamlit older versions
+        start_dt, end_dt = st.date_input("Time window", value=(dt_min, dt_max), min_value=dt_min, max_value=dt_max,
+                                         help="Limits the rows we transform to your chosen period.")
+        if isinstance(start_dt, (list, tuple)):  # guard older Streamlit behavior
             start_dt, end_dt = start_dt[0], end_dt[1]
         mask = (df["_tfm_time"].dt.date >= start_dt) & (df["_tfm_time"].dt.date <= end_dt)
         df = df.loc[mask].reset_index(drop=True)
@@ -152,7 +164,7 @@ if not metrics_all:
     st.info("No numeric metrics available for transformation in this window.")
     st.stop()
 
-st.subheader("Configure transformations (table)")
+st.subheader("Configure transformations (edits apply only on submit)")
 sel_metrics = st.multiselect("Metrics to include", options=metrics_all, default=metrics_all[:min(8, len(metrics_all))])
 
 cfg_key = f"TFM_CFG__{dataset_name}__{excel_sheet or ''}"
@@ -176,7 +188,7 @@ def _defaults_for(s: pd.Series) -> Dict[str, Any]:
         "lag": 0,
         "adstock": round(float(T.suggest_adstock_decay(s)), 3),
         "scaling": "none",
-        "cannibal_pool": "",  # comma-separated list
+        "cannibal_pool": [],  # list of columns
     }
 
 # Ensure defaults for selected
@@ -184,71 +196,153 @@ for m in sel_metrics:
     if m not in st.session_state[cfg_key]:
         st.session_state[cfg_key][m] = _defaults_for(df[m])
 
-# Build editable table dataframe
-rows = []
-for m in sel_metrics:
-    c = st.session_state[cfg_key][m]
-    rows.append({
-        "metric": m,
-        "transform": c.get("transform", "none"),
-        "k": float(c.get("k", 1.0)),
-        "beta": float(c.get("beta", 1.0)),
-        "gamma": float(c.get("gamma", 0.0)),
-        "order": c.get("order", "transform_then_adstock"),
-        "lag": int(c.get("lag", 0)),
-        "adstock": float(c.get("adstock", 0.0)),
-        "scaling": c.get("scaling", "none"),
-        "cannibal_pool": c.get("cannibal_pool", "") if isinstance(c.get("cannibal_pool",""), str) else ",".join(c.get("cannibal_pool", [])),
-    })
-cfg_df = pd.DataFrame(rows)
+# ---------------- Form: edit many metrics without reruns ----------------
+with st.form("tfm_edit_form", clear_on_submit=False):
+    st.caption("Tip: Nothing updates until you press **Submit changes** below.")
+    edited: Dict[str, Dict[str, Any]] = {}
 
-# Editor with column configs
-cfg_df_edited = st.data_editor(
-    cfg_df,
-    key="tfm_cfg_editor",
-    num_rows="fixed",
-    use_container_width=True,
-    disabled=["metric"],
-    column_config={
-        "metric": st.column_config.TextColumn("Metric", help="Source column (fixed)"),
-        "transform": st.column_config.SelectboxColumn(
-            "Transform",
-            options=["none", "log", "negexp", "negexp_cann"],
-            help="Choose transform function"
-        ),
-        "k": st.column_config.NumberColumn("k", help="Curvature: log/negexp scale", step=1e-3, format="%.6f", min_value=0.0),
-        "beta": st.column_config.NumberColumn("beta", help="Negexp amplitude", step=0.1, format="%.3f", min_value=0.0),
-        "gamma": st.column_config.NumberColumn("gamma", help="Cannibalization 0..1 (negexp_cann only)", step=0.05, format="%.2f", min_value=0.0, max_value=1.0),
-        "order": st.column_config.SelectboxColumn("Order", options=["transform_then_adstock","adstock_then_transform"]),
-        "lag": st.column_config.NumberColumn("Lag", help="Periods to include in adstock window", min_value=0, max_value=52, step=1),
-        "adstock": st.column_config.NumberColumn("Adstock", help="Decay 0..1", min_value=0.0, max_value=1.0, step=0.05, format="%.2f"),
-        "scaling": st.column_config.SelectboxColumn("Scaling", options=["none","minmax","zscore"]),
-        "cannibal_pool": st.column_config.TextColumn("Cannibal pool", help="Comma-separated other metrics"),
-    },
-)
-
-# Sync edited table back to session
-for _, r in cfg_df_edited.iterrows():
-    m = r["metric"]
-    if m in st.session_state[cfg_key]:
-        st.session_state[cfg_key][m].update({
-            "transform": str(r["transform"]),
-            "k": float(r["k"]),
-            "beta": float(r["beta"]),
-            "gamma": float(r["gamma"]),
-            "order": str(r["order"]),
-            "lag": int(r["lag"]),
-            "adstock": float(r["adstock"]),
-            "scaling": str(r["scaling"]),
-            "cannibal_pool": [x.strip() for x in str(r["cannibal_pool"] or "").split(",") if x.strip()],
-        })
-
-# Suggested (all)
-if st.button("Apply suggested (all)"):
     for m in sel_metrics:
-        keep_pool = st.session_state[cfg_key][m].get("cannibal_pool", [])
+        conf = st.session_state[cfg_key][m].copy()
+        with st.expander(f"{m}", expanded=False):
+            # Transform choice
+            conf["transform"] = st.selectbox(
+                f"{m} — Transform",
+                options=["none", "log", "negexp", "negexp_cann"],
+                index=["none", "log", "negexp", "negexp_cann"].index(conf.get("transform","none")),
+                key=f"{dataset_name}__{m}__transform",
+                help="Pick how to reshape this channel's raw values."
+            )
+
+            # Conditional parameter row 1 (k, beta, gamma)
+            c1, c2, c3 = st.columns(3)
+            if conf["transform"] == "log":
+                conf["k"] = c1.number_input(
+                    "k (log)",
+                    min_value=1e-12,
+                    value=float(conf.get("k", 1.0)),
+                    step=1e-3, format="%.6f",
+                    key=f"{dataset_name}__{m}__klog",
+                    help="Curvature for log(1 + k·x). Larger k compresses more (values saturate sooner)."
+                )
+                c2.caption("beta not used")
+                c3.caption("gamma not used")
+            elif conf["transform"] == "negexp":
+                conf["k"] = c1.number_input(
+                    "k (negexp)",
+                    min_value=0.0,
+                    value=float(conf.get("k", 0.01)),
+                    step=1e-3, format="%.6f",
+                    key=f"{dataset_name}__{m}__kneg",
+                    help="Speed to saturation: higher k reaches the ceiling with less spend."
+                )
+                conf["beta"] = c2.number_input(
+                    "beta",
+                    min_value=0.0,
+                    value=float(conf.get("beta", 1.0)),
+                    step=0.1, format="%.3f",
+                    key=f"{dataset_name}__{m}__beta",
+                    help="Ceiling (max effect) for the channel's response."
+                )
+                c3.caption("gamma not used")
+            elif conf["transform"] == "negexp_cann":
+                conf["k"] = c1.number_input(
+                    "k (negexp)",
+                    min_value=0.0,
+                    value=float(conf.get("k", 0.01)),
+                    step=1e-3, format="%.6f",
+                    key=f"{dataset_name}__{m}__knegc",
+                    help="Speed to saturation: higher k reaches the ceiling with less spend."
+                )
+                conf["beta"] = c2.number_input(
+                    "beta",
+                    min_value=0.0,
+                    value=float(conf.get("beta", 1.0)),
+                    step=0.1, format="%.3f",
+                    key=f"{dataset_name}__{m}__betac",
+                    help="Ceiling (max effect) for the channel's response."
+                )
+                conf["gamma"] = c3.number_input(
+                    "gamma (0–1)",
+                    min_value=0.0, max_value=1.0,
+                    value=float(conf.get("gamma", 0.0)),
+                    step=0.05, format="%.2f",
+                    key=f"{dataset_name}__{m}__gammac",
+                    help="Cannibalization strength from selected competing channels."
+                )
+                # Pool chooser
+                pool_opts = [c for c in metrics_all if c != m]
+                conf["cannibal_pool"] = st.multiselect(
+                    "Cannibalization pool (optional)",
+                    options=pool_opts,
+                    default=conf.get("cannibal_pool", []),
+                    key=f"{dataset_name}__{m}__pool",
+                    help="Other channels that can steal impact from this one."
+                )
+            else:
+                c1.caption("no params"); c2.caption("no params"); c3.caption("no params")
+
+            # Row 2: order / lag / adstock / scaling
+            d1, d2, d3, d4 = st.columns(4)
+            conf["order"] = d1.selectbox(
+                "Order",
+                options=["transform_then_adstock", "adstock_then_transform"],
+                index=["transform_then_adstock", "adstock_then_transform"].index(conf.get("order","transform_then_adstock")),
+                key=f"{dataset_name}__{m}__order",
+                help="Choose whether to saturate then carry over to future periods, or vice versa."
+            )
+            conf["lag"] = d2.number_input(
+                "Lag (periods)", min_value=0, max_value=52, step=1,
+                value=int(conf.get("lag", 0)),
+                key=f"{dataset_name}__{m}__lag",
+                help="How many past periods contribute. With lag=2 and decay r, effect = x_t + r·x_{t-1} + r²·x_{t-2}."
+            )
+            conf["adstock"] = d3.number_input(
+                "Adstock (0–1)", min_value=0.0, max_value=1.0, step=0.05,
+                value=float(conf.get("adstock", 0.0)),
+                key=f"{dataset_name}__{m}__ad",
+                help="Memory/decay: 0=only current period, 1=full carryover. Typical range 0.3–0.8."
+            )
+            conf["scaling"] = d4.selectbox(
+                "Scaling",
+                options=["none", "minmax", "zscore"],
+                index=["none", "minmax", "zscore"].index(conf.get("scaling","none")),
+                key=f"{dataset_name}__{m}__scaling",
+                help="Rescale the transformed series (often 'none' is fine for OLS)."
+            )
+
+        edited[m] = conf  # collect edits for this metric
+
+    # Apply suggested (for selected metrics only) without leaving the form
+    c_form_left, c_form_right = st.columns([1,1])
+    with c_form_left:
+        suggest_clicked = st.form_submit_button(
+            "Apply suggested (selected)",
+            help="Fill sensible defaults based on each metric's distribution.",
+            type="secondary",
+            use_container_width=True
+        )
+    with c_form_right:
+        submit_clicked = st.form_submit_button(
+            "Submit changes",
+            help="Apply all the edits above to your configuration.",
+            type="primary",
+            use_container_width=True
+        )
+
+# Apply suggestions or persist edits after the form returns
+if "edited" not in st.session_state:
+    st.session_state["edited"] = {}
+
+if 'suggest_clicked' in locals() and suggest_clicked:
+    for m in sel_metrics:
+        keep_pool = edited[m].get("cannibal_pool", st.session_state[cfg_key][m].get("cannibal_pool", []))
         st.session_state[cfg_key][m] = {**_defaults_for(df[m]), "cannibal_pool": keep_pool}
-    st.rerun()
+    st.success("Suggestions applied. Click Submit changes if you made further manual tweaks.")
+
+if 'submit_clicked' in locals() and submit_clicked:
+    for m in sel_metrics:
+        st.session_state[cfg_key][m] = edited[m]
+    st.success("Configuration saved.")
 
 st.divider()
 
@@ -259,8 +353,11 @@ def _build_config_map() -> Dict[str, Dict[str, Any]]:
         out[m] = dict(st.session_state[cfg_key][m])
     return out
 
+if not sel_metrics:
+    st.stop()
+
 config_map = _build_config_map()
-cannib_pools = {m: st.session_state[cfg_key][m].get("cannibal_pool", []) for m in sel_metrics}
+cannib_pools = {m: config_map[m].get("cannibal_pool", []) for m in sel_metrics}
 
 # Validate and previews
 cV, cP, cS = st.columns([1,1,1])
@@ -288,16 +385,16 @@ with cV:
             st.success("Validation passed.")
 
 with cP:
-    metric_to_preview = st.selectbox("Preview metric", options=sel_metrics if sel_metrics else ["(none)"])
+    metric_to_preview = st.selectbox("Preview metric", options=sel_metrics)
     if st.button("Preview selected metric"):
-        if not sel_metrics:
-            st.warning("Select metrics above first.")
-        else:
+        try:
             params = config_map[metric_to_preview]
             y = T.apply_pipeline(df, metric_to_preview, params, cannib_pools.get(metric_to_preview, []))
-            prev = pd.DataFrame({metric_to_preview: df[metric_to_preview], metric_to_preview+"__tfm_preview": y})
-            st.line_chart(prev[[metric_to_preview, metric_to_preview+"__tfm_preview"]])
+            prev = pd.DataFrame({metric_to_preview: df[metric_to_preview], metric_to_preview+"__tfm": y})
+            st.line_chart(prev[[metric_to_preview, metric_to_preview+"__tfm"]])
             st.dataframe(prev.head(50), use_container_width=True)
+        except Exception as e:
+            st.error(f"Preview failed: {e}")
 
 with cS:
     if st.button("Preview transformed table"):
@@ -313,7 +410,8 @@ with cS:
 st.subheader("Apply & Save")
 base = os.path.splitext(os.path.basename(dataset_name))[0]
 default_out = f"{base}__tfm.csv"
-out_name = st.text_input("Output filename (data/)", value=default_out)
+out_name = st.text_input("Output filename (data/)", value=default_out,
+                         help="Your transformed table will be written to the data/ folder.")
 
 if st.button("Apply and save"):
     try:
