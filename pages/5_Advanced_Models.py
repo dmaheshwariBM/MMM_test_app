@@ -1,5 +1,5 @@
 # pages/5_Advanced_Models.py
-import os, json, glob, re
+import os, json, glob, re, importlib
 from datetime import datetime
 from typing import List, Dict, Any
 
@@ -7,7 +7,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core import advanced_models  # module with breakout/residual/pathway functions
+# ---- Import + hot-reload the core module (so updates are picked up) ----
+from core import advanced_models as am
+importlib.reload(am)
 
 st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
 
@@ -41,8 +43,7 @@ def _load_results_catalog() -> List[Dict[str, Any]]:
     return rows
 
 def _load_dataset_csv(name: str) -> pd.DataFrame:
-    path = os.path.join(DATA_DIR, name)
-    return pd.read_csv(path)
+    return pd.read_csv(os.path.join(DATA_DIR, name))
 
 def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
@@ -60,23 +61,24 @@ def _persist_record(model_name: str, target: str, dataset: str, record: Dict[str
                    "dataset": dataset}, f, indent=2)
     return out_dir
 
-def _overwrite_base(base_name: str, new_record: Dict[str, Any]) -> None:
+def _overwrite_base(base_name: str, new_decomp: Dict[str, Any], base_record: Dict[str, Any]) -> None:
+    """Replace only the decomp in the JSON with name==base_name."""
     for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
         try:
             with open(jf, "r") as f:
                 rec = json.load(f)
             if str(rec.get("name","")).strip().lower() == str(base_name).strip().lower():
-                keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset")}
+                keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
+                keep["decomp"] = new_decomp
                 with open(jf, "w") as g:
-                    json.dump({**keep, **new_record}, g, indent=2)
+                    json.dump(keep, g, indent=2)
                 return
         except Exception:
             continue
 
 def _render_decomp(decomp: Dict[str, Any]):
-    if not decomp: 
-        st.info("No decomposition available.")
-        return
+    if not decomp:
+        st.info("No decomposition available."); return
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Base %", f"{float(decomp.get('base_pct',0)):.1f}%")
     with c2: st.metric("Carryover %", f"{float(decomp.get('carryover_pct',0)):.1f}%")
@@ -93,57 +95,22 @@ def _ensure_list_unique(seq: List[str]) -> List[str]:
             seen.add(s); out.append(s)
     return out
 
-# ---------- Fallback for missing helper on older modules ----------
-def _fallback_ensure_decomp(record: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
-    """Minimal decomp if module helper is absent."""
-    coef = record.get("coef", {}) or {}
-    features = record.get("features", []) or []
-    yhat = np.asarray(record.get("yhat", []), float)
-    if yhat.size == 0:
-        yhat = np.zeros(len(df), dtype=float)
+# ---------------------------
+# Version / attribute guards
+# ---------------------------
+REQUIRED_FUNCS = [
+    "breakout_split",
+    "residual_reattribute",
+    "pathway_redistribute",
+    "apply_decomp_update",
+    "_ensure_decomp_from_record_or_recompute",
+]
+missing = [fn for fn in REQUIRED_FUNCS if not hasattr(am, fn)]
+if missing:
+    st.error(f"advanced_models.py is missing: {', '.join(missing)}")
+    st.stop()
 
-    # Build contribution series per feature: coef * x
-    contrib_sum = {}
-    base_series = None
-    for f in features:
-        c = float(coef.get(f, 0.0))
-        if f == "const":
-            base_series = pd.Series(np.full(len(df), c), index=df.index)
-            contrib_sum[f] = float(base_series.sum())
-        else:
-            if f in df.columns:
-                x = pd.to_numeric(df[f], errors="coerce").fillna(0.0)
-            elif f.endswith("__tfm") and f[:-5] in df.columns:
-                x = pd.to_numeric(df[f[:-5]], errors="coerce").fillna(0.0)
-            else:
-                x = pd.Series(np.zeros(len(df)), index=df.index)
-            s = (c * x).clip(lower=0.0).sum()
-            contrib_sum[f] = float(s)
-
-    total_pred = float(max(yhat.sum(), 1e-12))
-    if total_pred <= 0:
-        total_pred = float(sum(contrib_sum.values())) or 1.0
-
-    base_pct = 100.0 * float(contrib_sum.get("const", 0.0)) / total_pred
-    impact_map = {}
-    for f, s in contrib_sum.items():
-        if f == "const": 
-            continue
-        disp = f[:-5] if f.endswith("__tfm") else f
-        if s > 0:
-            impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * float(s) / total_pred
-
-    carry_pct = 0.0
-    incr_pct = max(0.0, 100.0 - base_pct - carry_pct)
-    return {
-        "base_pct": base_pct,
-        "carryover_pct": carry_pct,
-        "incremental_pct": incr_pct,
-        "impactable_pct": impact_map
-    }
-
-# Use module helper if present; else fallback
-ensure_decomp = getattr(advanced_models, "_ensure_decomp_from_record_or_recompute", _fallback_ensure_decomp)
+st.caption(f"Core advanced models version: **{getattr(am, 'ADV_MODELS_VERSION', 'unknown')}**")
 
 # ---------------------------
 # Pick base model
@@ -157,20 +124,16 @@ base_labels = [f"{r.get('name','(unnamed)')}  —  ({r.get('dataset','?')} / tar
 sel = st.selectbox("Base model to extend", options=base_labels, index=0)
 base = catalog[base_labels.index(sel)]
 
-# Load dataset
 try:
     df = _load_dataset_csv(base["dataset"])
 except Exception as e:
-    st.error(f"Could not open dataset '{base['dataset']}'.")
-    st.exception(e)
-    st.stop()
+    st.error(f"Could not open dataset '{base['dataset']}'."); st.exception(e); st.stop()
 
-# Prepare lists
 features = [f for f in base.get("features", []) if f != "const"]
 features_disp = [f[:-5] if f.endswith("__tfm") else f for f in features]
-decomp = ensure_decomp(base, df)
-impact_map = dict(decomp.get("impactable_pct", {}))
+decomp = am._ensure_decomp_from_record_or_recompute(base, df)
 num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+base_set_disp = set(features_disp)
 
 st.caption(f"Dataset: **{base['dataset']}** • Target: **{base.get('target','?')}**")
 
@@ -184,14 +147,13 @@ with tab1:
     st.subheader("Breakout split (no intercept; sum preserved)")
     st.caption("Pick a base channel to split; then pick sub-metrics NOT in the base model. The parent impact is distributed across the chosen sub-metrics; totals stay the same.")
 
-    parent = st.selectbox("Channel to split (from base model)", options=features_disp)
-    base_set_disp = set(features_disp)
+    parent = st.selectbox("Channel to split (from base)", options=features_disp)
     candidates = [c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))]
     subs = st.multiselect("Sub-metrics (not in base)", options=candidates)
 
     if st.button("Run breakout split", type="primary"):
         try:
-            out = advanced_models.breakout_split(
+            out = am.breakout_split(
                 df=df,
                 base_record=base,
                 channel_to_split=parent,
@@ -203,7 +165,7 @@ with tab1:
                                       "Allocated %": list(out["allocated"].values())})
             st.dataframe(alloc_tbl, use_container_width=True)
 
-            new_decomp = advanced_models.apply_decomp_update(base, df, out)
+            new_decomp = am.apply_decomp_update(base, df, out)
             st.markdown("**Preview updated decomposition**")
             _render_decomp(new_decomp)
 
@@ -219,9 +181,7 @@ with tab1:
                     st.success(f"Saved to `{where}`.")
             with c2:
                 if st.button("Update base result"):
-                    payload = {k: base.get(k) for k in ("metrics","coef","yhat","features")}
-                    payload.update({"type": base.get("type","base"), "decomp": new_decomp})
-                    _overwrite_base(base["name"], payload)
+                    _overwrite_base(base["name"], new_decomp, base)
                     st.success("Base model updated.")
         except Exception as e:
             st.error("Breakout failed.")
@@ -230,17 +190,16 @@ with tab1:
 # ===== Residual re-attribution =====
 with tab2:
     st.subheader("Residual re-attribution (allocate from Base % to new channels)")
-    st.caption("Select extra channels NOT in the base model. A share of **Base %** will be allocated to them; Base % decreases by the same total; incremental % increases.")
+    st.caption("Select extra channels NOT in the base model. A share of **Base %** will be allocated to them; Base % decreases by the same total; Incremental % increases.")
 
     base_pct = float(decomp.get("base_pct", 0.0))
     st.info(f"Current Base %: **{base_pct:.1f}%**")
 
-    base_set_disp = set(features_disp)
     extra = st.multiselect("Extra channels (not in base)", options=[c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))])
 
     if st.button("Run residual re-attribution", type="primary"):
         try:
-            out = advanced_models.residual_reattribute(
+            out = am.residual_reattribute(
                 df=df,
                 base_record=base,
                 extra_channels=_ensure_list_unique(extra)
@@ -251,7 +210,7 @@ with tab2:
                                        "From Base % (pp)": list(out["allocated"].values())}),
                          use_container_width=True)
 
-            new_decomp = advanced_models.apply_decomp_update(base, df, out)
+            new_decomp = am.apply_decomp_update(base, df, out)
             st.markdown("**Preview updated decomposition**")
             _render_decomp(new_decomp)
 
@@ -267,9 +226,7 @@ with tab2:
                     st.success(f"Saved to `{where}`.")
             with c2:
                 if st.button("Update base result", key="upd_resid"):
-                    payload = {k: base.get(k) for k in ("metrics","coef","yhat","features")}
-                    payload.update({"type": base.get("type","base"), "decomp": new_decomp})
-                    _overwrite_base(base["name"], payload)
+                    _overwrite_base(base["name"], new_decomp, base)
                     st.success("Base model updated.")
         except Exception as e:
             st.error("Residual re-attribution failed.")
@@ -289,7 +246,7 @@ with tab3:
 
         if st.button("Run pathway redistribution", type="primary"):
             try:
-                out = advanced_models.pathway_redistribute(
+                out = am.pathway_redistribute(
                     df=df,
                     base_record=base,
                     channel_A=A,
@@ -303,7 +260,7 @@ with tab3:
                     "B old": out["B_old"], "B new": out["B_new"],
                 }]))
 
-                new_decomp = advanced_models.apply_decomp_update(base, df, out)
+                new_decomp = am.apply_decomp_update(base, df, out)
                 st.markdown("**Preview updated decomposition**")
                 _render_decomp(new_decomp)
 
@@ -319,9 +276,7 @@ with tab3:
                         st.success(f"Saved to `{where}`.")
                 with c2:
                     if st.button("Update base result", key="upd_path"):
-                        payload = {k: base.get(k) for k in ("metrics","coef","yhat","features")}
-                        payload.update({"type": base.get("type","base"), "decomp": new_decomp})
-                        _overwrite_base(base["name"], payload)
+                        _overwrite_base(base["name"], new_decomp, base)
                         st.success("Base model updated.")
             except Exception as e:
                 st.error("Pathway redistribution failed.")
