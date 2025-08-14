@@ -1,5 +1,5 @@
 # pages/5_Advanced_Models.py
-import os, json, glob, re
+import os, json, glob, re, itertools
 from datetime import datetime
 from typing import List, Tuple, Dict, Any
 
@@ -62,9 +62,6 @@ def _persist_record(model_name: str, target: str, dataset: str, record: Dict[str
     return out_dir
 
 def _overwrite_base(base_name: str, new_record: Dict[str, Any]) -> None:
-    """
-    Find existing JSON with name==base_name and replace its content.
-    """
     for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
         try:
             with open(jf, "r") as f:
@@ -77,6 +74,17 @@ def _overwrite_base(base_name: str, new_record: Dict[str, Any]) -> None:
         except Exception:
             continue
 
+def _render_decomp_summary(decomp: Dict[str, Any]):
+    if not decomp: return
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("Base %", f"{decomp.get('base_pct',0):.1f}%")
+    with c2: st.metric("Carryover %", f"{decomp.get('carryover_pct',0):.1f}%")
+    with c3: st.metric("Incremental %", f"{decomp.get('incremental_pct',0):.1f}%")
+    imp = decomp.get("impactable_pct", {})
+    if imp:
+        dfv = pd.DataFrame({"Channel": list(imp.keys()), "Impactable %": list(imp.values())})
+        st.bar_chart(dfv.set_index("Channel"))
+
 # ---------------------------
 # Pick base model to extend
 # ---------------------------
@@ -86,8 +94,7 @@ if not cat:
     st.stop()
 
 base_options = [f"{r['name']}  —  ({r['dataset']}  /  target: {r['target']})" for r in cat]
-base_idx = 0
-sel = st.selectbox("Base model to extend", options=base_options, index=base_idx)
+sel = st.selectbox("Base model to extend", options=base_options, index=0)
 base = cat[base_options.index(sel)]
 
 # Load base data
@@ -99,7 +106,7 @@ except Exception as e:
     st.stop()
 
 target = base["target"]
-features = [c for c in base["features"] if c in df.columns]  # guard
+features = [c for c in base["features"] if c in df.columns]
 
 st.caption(f"Using dataset: **{base['dataset']}**  •  Target: **{target}**  •  Base features: {', '.join(features)}")
 
@@ -111,19 +118,19 @@ tab1, tab2, tab3 = st.tabs(["📊 Breakout model", "🧩 Pathway (Interactions)"
 # ===== Breakout =====
 with tab1:
     st.subheader("Breakout (grouped) models")
-    # Choose grouping column (categoricals suggested first)
     cat_like = [c for c in df.columns if (df[c].dtype == "object" or df[c].nunique() <= 50)]
     group_col = st.selectbox("Group by", options=cat_like or list(df.columns))
     min_n = st.number_input("Minimum rows per group", min_value=10, value=30, step=5)
     add_const = st.checkbox("Add intercept", value=True)
     force_nn = st.checkbox("Force non-negative coefficients", value=False,
-                           help="If enabled, negative coefs are set to zero using constrained fit.")
+                           help="If enabled, constrained fit zeroes negative coefs.")
     run_break = st.button("Run breakout models", type="primary")
 
     if run_break:
         try:
             out = advanced_models.run_breakout_models(
                 df, target, features, group_col,
+                dataset_csv_name=base["dataset"],
                 min_group_n=int(min_n),
                 add_const=add_const,
                 force_nonnegative=force_nn
@@ -131,31 +138,38 @@ with tab1:
             # summarize
             rows = []
             for g, rec in out["results"].items():
-                m = rec["metrics"]
-                rows.append({"Group": g, "n": m.get("n"), "R²": m.get("r2"), "Adj R²": m.get("adj_r2"), "RMSE": m.get("rmse")})
-            summ = pd.DataFrame(rows).sort_values("R²", ascending=False)
-            st.dataframe(summ, use_container_width=True)
+                m = rec["metrics"]; d = rec.get("decomp", {})
+                rows.append({
+                    "Group": g, "n": m.get("n"), "R²": m.get("r2"),
+                    "Base %": d.get("base_pct"), "Carryover %": d.get("carryover_pct"),
+                    "Incremental %": d.get("incremental_pct"), "RMSE": m.get("rmse")
+                })
+            if rows:
+                st.dataframe(pd.DataFrame(rows).sort_values("R²", ascending=False), use_container_width=True)
+            # quick inspect decomp of top group
+            if rows:
+                best_g = max(out["results"].keys(), key=lambda gg: out["results"][gg]["metrics"].get("r2", -1))
+                st.markdown(f"**Top group by R²:** {best_g}")
+                _render_decomp_summary(out["results"][best_g].get("decomp", {}))
 
-            # save set as one record (holds all groups)
+            # save pack
             name_new = st.text_input("Name for breakout pack", value=f"{base['name']}__breakout__{group_col}")
             if st.button("Save breakout results"):
-                pack = {
+                where = _persist_record(name_new, target, base["dataset"], {
                     "type": "breakout",
                     "group_col": group_col,
                     "base_name": base["name"],
                     "base_features": features,
                     "results_per_group": out["results"],
                     "metrics": {"note": "see per-group"},
-                }
-                where = _persist_record(name_new, target, base["dataset"], pack)
+                })
                 st.success(f"Saved breakout pack in `{where}`.")
-            # allow base overwrite by selected best group
+
+            # overwrite base with chosen group
             st.markdown("—")
-            st.caption("Optionally overwrite the base model with one group's fit (best by R² suggested).")
+            st.caption("Optionally overwrite the base model with one group's fit.")
             if rows:
-                best = max(rows, key=lambda d: d["R²"] if d["R²"] is not None else -1)
-                pick = st.selectbox("Choose group to overwrite base with", options=[r["Group"] for r in rows],
-                                    index=[r["Group"] for r in rows].index(best["Group"]))
+                pick = st.selectbox("Choose group to overwrite base with", options=list(out["results"].keys()))
                 if st.button("Overwrite base model with chosen group"):
                     rec = out["results"][str(pick)]
                     overwrite_payload = {
@@ -164,6 +178,7 @@ with tab1:
                         "coef": rec["coef"],
                         "yhat": rec["yhat"],
                         "features": rec["features"],
+                        "decomp": rec.get("decomp", {})
                     }
                     _overwrite_base(base["name"], overwrite_payload)
                     st.success(f"Base model **{base['name']}** overwritten using group **{pick}**.")
@@ -175,22 +190,17 @@ with tab1:
 with tab2:
     st.subheader("Pathway / Interaction model")
     st.caption("Add interaction (product) terms between drivers to capture synergies or cannibalization.")
-    cols = [c for c in features]  # candidates
-    # Suggest top interactions
+    cols = [c for c in features]
     k = st.number_input("Suggest top-K interactions by |corr(product, target)|", min_value=0, value=5, step=1)
     suggested = []
     if st.button("Suggest interactions"):
         try:
             suggested = advanced_models.suggest_interactions_by_corr(df, target, cols, top_k=int(k))
-            st.info("Suggested pairs: " + ", ".join([f"{a}×{b}" for a,b in suggested]) if suggested else "None found.")
+            st.info("Suggested pairs: " + (", ".join([f"{a}×{b}" for a,b in suggested]) if suggested else "None"))
         except Exception as e:
             st.warning(f"Suggestion failed: {e}")
 
-    # Manual multi-select (preselect suggestions if any)
     all_pairs = list(itertools.combinations(cols, 2))
-    # import itertools locally (Streamlit will rerun; safe to re-import)
-    import itertools as _it
-    all_pairs = list(_it.combinations(cols, 2))
     def _fmt_pair(p): return f"{p[0]} × {p[1]}"
     label_pairs = [_fmt_pair(p) for p in all_pairs]
     preselect = [label_pairs[all_pairs.index(p)] for p in suggested] if suggested else []
@@ -205,10 +215,12 @@ with tab2:
         try:
             out = advanced_models.run_interaction_model(
                 df, target, features, chosen_pairs,
+                dataset_csv_name=base["dataset"],
                 add_const=add_const_ix, force_nonnegative=force_nn_ix
             )
             m = out["metrics"]
             st.write(pd.DataFrame([m]))
+            _render_decomp_summary(out.get("decomp", {}))
             st.write("Interaction terms added:", [f"{a}×{b}" for a,b in chosen_pairs])
 
             name_new = st.text_input("Name for interaction model", value=f"{base['name']}__interactions_{len(chosen_pairs)}")
@@ -220,6 +232,7 @@ with tab2:
                     "yhat": out["yhat"],
                     "features": out["features"],
                     "interaction_pairs": out["interaction_pairs"],
+                    "decomp": out.get("decomp", {}),
                     "base_name": base["name"],
                 }
                 where = _persist_record(name_new, target, base["dataset"], payload)
@@ -231,6 +244,7 @@ with tab2:
                     "coef": out["coef"],
                     "yhat": out["yhat"],
                     "features": out["features"],
+                    "decomp": out.get("decomp", {}),
                 }
                 _overwrite_base(base["name"], overwrite_payload)
                 st.success(f"Base model **{base['name']}** overwritten with interaction model.")
@@ -242,7 +256,6 @@ with tab2:
 with tab3:
     st.subheader("Residual (two-stage) model")
     st.caption("Stage 1 uses the base features; Stage 2 models residuals with additional features and optional AR lags.")
-    # additional features = any numeric cols not in base features or target
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     extra_candidates = [c for c in num_cols if c not in set(features+[target])]
     resid_feats = st.multiselect("Residual-stage features", options=extra_candidates, default=[])
@@ -257,12 +270,14 @@ with tab3:
                 df, target,
                 base_features=features,
                 residual_features=resid_feats,
+                dataset_csv_name=base["dataset"],
                 ar_lags=int(ar_lags),
                 force_nonnegative_base=force_nn1,
                 force_nonnegative_resid=force_nn2,
             )
             m = out["metrics"]
             st.write(pd.DataFrame([m]))
+            _render_decomp_summary(out.get("decomp", {}))
             st.json({"stage1_metrics": out["stage1"]["metrics"], "stage2_metrics": out["stage2"]["metrics"]})
 
             name_new = st.text_input("Name for residual model", value=f"{base['name']}__residual_aug")
@@ -275,6 +290,7 @@ with tab3:
                     "stage2": out["stage2"],
                     "features_stage1": out["features_stage1"],
                     "features_stage2": out["features_stage2"],
+                    "decomp": out.get("decomp", {}),
                     "base_name": base["name"],
                 }
                 where = _persist_record(name_new, target, base["dataset"], payload)
@@ -285,7 +301,8 @@ with tab3:
                     "metrics": m,
                     "coef": out["stage1"]["coef"],  # keep stage1 coefs as 'base' view
                     "yhat": out["yhat"],
-                    "features": out["features_stage1"],  # show stage1 features in base table
+                    "features": out["features_stage1"],
+                    "decomp": out.get("decomp", {}),
                 }
                 _overwrite_base(base["name"], overwrite_payload)
                 st.success(f"Base model **{base['name']}** overwritten with residual-augmented predictions.")
