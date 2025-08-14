@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_7_0"
+PAGE_ID = "RESULTS_PAGE_STANDALONE_v1_9_0"
 
 st.title("📊 Results — Compare, Inspect & Compose")
-st.caption(f"Page ID: `{PAGE_ID}` • Robust save/load across writable dirs")
+st.caption(f"Page ID: `{PAGE_ID}` • Persistent save message + robust writes")
 
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -21,18 +21,18 @@ def _abs(p: str) -> str: return os.path.abspath(p)
 
 CANDIDATE_RESULTS_ROOTS = [
     _abs(os.environ.get("MMM_RESULTS_DIR", "")) if os.environ.get("MMM_RESULTS_DIR") else None,
-    _abs("results"),
+    _abs(os.path.expanduser("~/.mmm_results")),
     _abs("/tmp/mmm_results"),
+    _abs("results"),
 ]
 CANDIDATE_RESULTS_ROOTS = [p for p in CANDIDATE_RESULTS_ROOTS if p]
 
 def _ensure_dir(path: str) -> bool:
     try:
         os.makedirs(path, exist_ok=True)
-        # quick write test
-        testf = os.path.join(path, ".write_test")
-        with open(testf, "w") as f: f.write("ok")
-        os.remove(testf)
+        probe = os.path.join(path, ".write_test")
+        with open(probe, "w") as f: f.write("ok")
+        os.remove(probe)
         return True
     except Exception:
         return False
@@ -41,13 +41,21 @@ def pick_writable_results_root() -> str:
     for root in CANDIDATE_RESULTS_ROOTS:
         if _ensure_dir(root):
             return root
-    # last resort: cwd
-    fallback = _abs("results_fallback")
-    _ensure_dir(fallback)
-    return fallback
+    # absolutely last resort: a new folder under HOME
+    fb = _abs(os.path.expanduser("~/mmm_results_fallback"))
+    _ensure_dir(fb)
+    return fb
 
 RESULTS_ROOT = pick_writable_results_root()
-st.caption(f"Results root: `{RESULTS_ROOT}`")
+
+# Persisted banner for last save status (survives reruns)
+if "last_saved_path" in st.session_state and st.session_state["last_saved_path"]:
+    st.success(f"Saved: `{st.session_state['last_saved_path']}`")
+if "last_save_error" in st.session_state and st.session_state["last_save_error"]:
+    st.error(st.session_state["last_save_error"])
+
+st.caption("Writable roots checked: " + ", ".join(f"`{r}`" for r in CANDIDATE_RESULTS_ROOTS))
+st.caption(f"Using results root: `{RESULTS_ROOT}`")
 
 # ───────────────────────── Utilities ─────────────────────────
 def _safe(s: str) -> str:
@@ -88,8 +96,7 @@ def _json_ready(obj: Any):
         try: return obj.tolist()
         except Exception: pass
     try:
-        if isinstance(obj, (_np.floating, _np.integer)):
-            return obj.item()
+        if isinstance(obj, (_np.floating, _np.integer)): return obj.item()
     except Exception:
         pass
     try:
@@ -110,14 +117,12 @@ def save_result_json(results_root: str, name: str, target: str, dataset: str, pa
     return full_path
 
 def load_results_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
-    """Recursively scan all candidate roots for **/*.json."""
     rows: List[Dict[str, Any]] = []
-    saw: set[str] = set()
+    seen: set[str] = set()
     for root in results_roots:
-        patt = os.path.join(root, "**", "*.json")
-        files = sorted(glob.glob(patt, recursive=True), reverse=True)
+        files = sorted(glob.glob(os.path.join(root, "**", "*.json"), recursive=True), reverse=True)
         for jf in files:
-            if jf in saw: continue
+            if jf in seen: continue
             try:
                 with open(jf, "r") as f:
                     r = json.load(f)
@@ -128,7 +133,7 @@ def load_results_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
                     except Exception: r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
                 else:
                     r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
-                rows.append(r); saw.add(jf)
+                rows.append(r); seen.add(jf)
             except Exception:
                 continue
     rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
@@ -444,20 +449,26 @@ with tab_compose:
             st.markdown("##### Save / Update / Send to Budget")
             cL, cM, cR = st.columns(3)
             with cL:
-                nm = st.text_input("Save as name", value=f"{base.get('name','base')}__composite")
-                if st.button("💾 Save as new result"):
-                    payload = {
-                        "type": "composite",
-                        "pipeline": st.session_state[ops_key],
-                        "decomp": current_decomp,
-                        "metrics": base.get("metrics", {}),
-                        "coef": base.get("coef", {}),
-                        "yhat": base.get("yhat", []),
-                        "features": base.get("features", []),
-                    }
-                    saved_file = save_result_json(RESULTS_ROOT, nm, base.get("target","?"), base.get("dataset","?"), payload)
-                    st.success(f"Saved: `{saved_file}`")
-                    st.rerun()
+                nm = st.text_input("Save as name", value=f"{base.get('name','base')}__composite", key="compose_name")
+                if st.button("💾 Save as new result", key="compose_save"):
+                    try:
+                        payload = {
+                            "type": "composite",
+                            "pipeline": st.session_state[ops_key],
+                            "decomp": current_decomp,
+                            "metrics": base.get("metrics", {}),
+                            "coef": base.get("coef", {}),
+                            "yhat": base.get("yhat", []),
+                            "features": base.get("features", []),
+                        }
+                        saved_file = save_result_json(RESULTS_ROOT, nm, base.get("target","?"), base.get("dataset","?"), payload)
+                        st.session_state["last_saved_path"] = saved_file
+                        st.session_state["last_save_error"] = ""
+                        st.success(f"Saved: `{saved_file}`")
+                    except Exception as e:
+                        st.session_state["last_saved_path"] = ""
+                        st.session_state["last_save_error"] = f"Save failed: {e}"
+                        st.error(st.session_state["last_save_error"])
             with cM:
                 if st.button("📤 Send PREVIEW to Budget Optimization"):
                     preview_skinny = [{
@@ -475,15 +486,26 @@ with tab_compose:
                     st.success("Preview sent to Budget Optimization.")
             with cR:
                 if st.button("✏ Update base result"):
-                    for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
-                        try:
+                    try:
+                        updated = False
+                        for jf in glob.glob(os.path.join(RESULTS_ROOT, "**", "*.json"), recursive=True):
                             with open(jf, "r") as f: rec0 = json.load(f)
                             if str(rec0.get("name","")).strip().lower() == str(base.get("name","")).strip().lower():
                                 keep = {k: rec0.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
                                 keep["decomp"] = current_decomp
                                 with open(jf, "w") as g: json.dump(_json_ready(keep), g, indent=2)
-                                st.success("Base model updated."); st.rerun(); break
-                        except Exception:
-                            continue
-        except Exception as e:
-            st.error("Composition failed."); st.exception(e)
+                                st.session_state["last_saved_path"] = jf
+                                st.session_state["last_save_error"] = ""
+                                st.success(f"Updated base at: `{jf}`")
+                                updated = True
+                                break
+                        if not updated:
+                            st.warning("No matching base record found to update.")
+                    except Exception as e:
+                        st.session_state["last_saved_path"] = ""
+                        st.session_state["last_save_error"] = f"Update failed: {e}"
+                        st.error(st.session_state["last_save_error"])
+
+    st.divider()
+    if st.button("🔃 Reload catalog now"):
+        st.rerun()
