@@ -1,241 +1,444 @@
-# pages/5_Advanced_Models.py
-import os, json, glob, re, importlib.util, pathlib
-from datetime import datetime
-from typing import List, Dict, Any
+# core/advanced_models.py
+"""
+Advanced MMM post-processing utilities
+Version: 2.4.1
 
+Workflows:
+- breakout_split: re-split one base channel’s impact into selected sub-metrics (no intercept; sum preserved)
+- residual_reattribute: regress the BASE (intercept) series on selected channels; reattribute the *fitted share* of Base
+- pathway_redistribute: move a share of Channel A’s impact to Channel B; totals preserved
+- apply_decomp_update: apply any of the above updates to a base record’s decomposition
+- _ensure_decomp_from_record_or_recompute: robust decomp if missing (stable denominator + intercept detection)
+
+All NumPy/Pandas; no Streamlit or importlib here.
+"""
+from __future__ import annotations
+import re
+from typing import List, Dict, Any, Optional
 import numpy as np
 import pandas as pd
-import streamlit as st
 
-PAGE_ID = "ADVANCED_MODELS_PAGE_v2_4_0"
-
-st.title("🧠 Advanced Models — Breakout • Residual • Pathway")
-st.caption(f"Page ID: `{PAGE_ID}`")
-
-DATA_DIR = "data"
-RESULTS_DIR = "results"
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(RESULTS_DIR, exist_ok=True)
-
-# ---- Force-load local core modules by file path (avoids 'core' name collisions) ----
-ADV_CORE_PATH = pathlib.Path("core/advanced_models.py").resolve()
-if not ADV_CORE_PATH.exists():
-    st.error(f"Expected file not found: {ADV_CORE_PATH}"); st.stop()
-_spec = importlib.util.spec_from_file_location("advanced_models_local", ADV_CORE_PATH)
-am = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(am)  # type: ignore
-st.caption(f"Loaded advanced_models from: `{getattr(am, '__file__', 'unknown')}` (core version: {getattr(am, 'ADV_MODELS_VERSION', 'unknown')})")
-
-# ---------------------------
-# Helpers
-# ---------------------------
-def _load_results_catalog() -> List[Dict[str, Any]]:
-    rows = []
-    batches = sorted(glob.glob(os.path.join(RESULTS_DIR, "*")), reverse=True)
-    for b in batches:
-        for jf in sorted(glob.glob(os.path.join(b, "*.json")), reverse=True):
-            try:
-                with open(jf, "r") as f:
-                    r = json.load(f)
-                r["_path"] = jf
-                r["_batch"] = os.path.basename(b)
-                ts = r.get("batch_ts") or os.path.basename(b)
-                try:
-                    r["_ts"] = datetime.strptime(ts, "%Y%m%d_%H%M%S")
-                except Exception:
-                    r["_ts"] = datetime.fromtimestamp(os.path.getmtime(jf))
-                rows.append(r)
-            except Exception:
-                continue
-    rows.sort(key=lambda x: x.get("_ts", datetime.min), reverse=True)
-    return rows
-
-def _load_dataset_csv(name: str) -> pd.DataFrame:
-    return pd.read_csv(os.path.join(DATA_DIR, name))
-
-def _safe(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
-
-def _persist_record(model_name: str, target: str, dataset: str, record: Dict[str, Any]) -> str:
-    batch_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = os.path.join(RESULTS_DIR, batch_ts)
-    os.makedirs(out_dir, exist_ok=True)
-    fname = f"{batch_ts}__{_safe(model_name)}__{_safe(target)}.json"
-    with open(os.path.join(out_dir, fname), "w") as f:
-        json.dump({**record,
-                   "batch_ts": batch_ts,
-                   "name": model_name,
-                   "target": target,
-                   "dataset": dataset}, f, indent=2)
-    return out_dir
-
-def _overwrite_base(base_name: str, new_decomp: Dict[str, Any]) -> None:
-    for jf in glob.glob(os.path.join(RESULTS_DIR, "*", "*.json")):
-        try:
-            with open(jf, "r") as f:
-                rec = json.load(f)
-            if str(rec.get("name","")).strip().lower() == str(base_name).strip().lower():
-                keep = {k: rec.get(k) for k in ("batch_ts","name","target","dataset","metrics","coef","yhat","features","type")}
-                keep["decomp"] = new_decomp
-                with open(jf, "w") as g:
-                    json.dump(keep, g, indent=2)
-                return
-        except Exception:
-            continue
-
-def _render_decomp(decomp: Dict[str, Any]):
-    if not decomp:
-        st.info("No decomposition available."); return
-    c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Base %", f"{float(decomp.get('base_pct',0)):.2f}%")
-    with c2: st.metric("Carryover %", f"{float(decomp.get('carryover_pct',0)):.2f}%")
-    with c3: st.metric("Incremental %", f"{float(decomp.get('incremental_pct',0)):.2f}%")
-    imp = decomp.get("impactable_pct", {}) or {}
-    if imp:
-        dfv = pd.DataFrame({"Channel": list(imp.keys()), "Impactable %": list(imp.values())})
-        st.bar_chart(dfv.set_index("Channel"))
-
-# ---- Guard required funcs ----
-REQUIRED_FUNCS = [
+__all__ = [
+    "ADV_MODELS_VERSION",
     "breakout_split",
     "residual_reattribute",
     "pathway_redistribute",
     "apply_decomp_update",
     "_ensure_decomp_from_record_or_recompute",
+    "_normalize_and_round_decomp",
 ]
-missing = [fn for fn in REQUIRED_FUNCS if not hasattr(am, fn)]
-if missing:
-    st.error(f"`advanced_models.py` missing: {', '.join(missing)}\nLoaded from: {getattr(am, '__file__', 'unknown')}")
-    st.stop()
+
+ADV_MODELS_VERSION = "2.4.1"
 
 # ---------------------------
-# Pick base model
+# Helpers
 # ---------------------------
-catalog = _load_results_catalog()
-if not catalog:
-    st.info("No saved models found. Build a base model in **Modeling** first.")
-    st.stop()
+def _safe(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s))[:64]
 
-base_labels = [f"{r.get('name','(unnamed)')} • {r.get('target','?')} • {r.get('_ts').strftime('%Y-%m-%d %H:%M:%S') if r.get('_ts') else ''}" for r in catalog]
-sel = st.selectbox("Base model to extend", options=base_labels, index=0)
-base = catalog[base_labels.index(sel)]
+def _to_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(0.0)
 
-try:
-    df = _load_dataset_csv(base["dataset"])
-except Exception as e:
-    st.error(f"Could not open dataset '{base['dataset']}'."); st.exception(e); st.stop()
+def _intercept_key(coef: Dict[str, float]) -> Optional[str]:
+    for k in ("const", "Intercept", "intercept", "CONST", "const_", "_const", "beta0", "b0"):
+        if k in coef:
+            return k
+    return None
 
-features = [f for f in base.get("features", []) if f != "const"]
-features_disp = [f[:-5] if f.endswith("__tfm") else f for f in features]
-decomp0 = am._ensure_decomp_from_record_or_recompute(base, df)
-num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-base_set_disp = set(features_disp)
+def _feature_series(df: pd.DataFrame, name: str) -> pd.Series:
+    """Return feature series from df. If name=='const', return a 1s vector."""
+    if name == "const":
+        return pd.Series(np.ones(len(df)), index=df.index, name="const")
+    if name in df.columns:
+        return _to_num(df[name])
+    if name.endswith("__tfm") and name[:-5] in df.columns:
+        return _to_num(df[name[:-5]])
+    return pd.Series(np.zeros(len(df)), index=df.index, name=name)
 
-st.caption(f"Dataset: **{base['dataset']}** • Target: **{base.get('target','?')}**")
-st.info(f"Base % (current): **{float(decomp0.get('base_pct',0)):.2f}%**")
+def _contrib_series(df: pd.DataFrame, coef: Dict[str, float], features: List[str]) -> Dict[str, pd.Series]:
+    """Contribution time series for each feature: coef_j * x_j(t). Includes intercept as 'const' if present."""
+    out: Dict[str, pd.Series] = {}
+    n = len(df)
+    ik = _intercept_key(coef)
+    if ik is not None:
+        out["const"] = float(coef.get(ik, 0.0)) * pd.Series(np.ones(n), index=df.index)
+    for f in features:
+        if f == "const":
+            continue
+        c = float(coef.get(f, 0.0))
+        out[f] = c * _feature_series(df, f)
+    return out
 
 # ---------------------------
-# Tabs (Advanced Models only)
+# Robust decomp
 # ---------------------------
-tab1, tab2, tab3 = st.tabs(["📊 Breakout split", "➕ Residual (on Base)", "🧩 Pathway redistribution"])
+def _ensure_decomp_from_record_or_recompute(record: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Ensure 'decomp' exists. If missing, recompute a minimal one:
+      - base_pct from intercept ('const') share
+      - impactable_pct from positive contributions of non-const features
+      - carryover_pct set to 0
 
-# ===== Breakout split =====
-with tab1:
-    st.subheader("Breakout split")
-    parent = st.selectbox("Channel to split (from base)", options=features_disp)
-    candidates = [c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))]
-    subs = st.multiselect("Sub-metrics (not in base model)", options=candidates)
+    Denominator priority:
+      1) sum(actual target) if available
+      2) sum(yhat) if > 0
+      3) sum(all contributions, incl. const)
+      4) 1.0
+    """
+    d = record.get("decomp")
+    if isinstance(d, dict) and "impactable_pct" in d:
+        return _normalize_and_round_decomp(d)
 
-    if st.button("Run breakout split", type="primary"):
-        try:
-            out = am.breakout_split(df=df, base_record=base, channel_to_split=parent, sub_metrics=subs)
-            new_decomp = am.apply_decomp_update(base, df, out)
-            st.success("Breakout computed. Preview below:")
-            _render_decomp(new_decomp)
+    coef = record.get("coef", {}) or {}
+    features = record.get("features", []) or []
+    contrib = _contrib_series(df, coef, features)
 
-            c1, c2 = st.columns(2)
-            with c1:
-                name_new = st.text_input("Save as name", value=f"{base['name']}__breakout_{parent}")
-                if st.button("Save as new result"):
-                    where = _persist_record(name_new, base.get("target","?"), base["dataset"], {**base, "type": "breakout_split", "decomp": new_decomp})
-                    st.success(f"Saved to `{where}`.")
-            with c2:
-                if st.button("Update base result"):
-                    _overwrite_base(base["name"], new_decomp)
-                    st.success("Base model updated.")
-        except Exception as e:
-            st.error("Breakout failed.")
-            st.exception(e)
+    # Denominator candidates
+    total_from_y = None
+    tgt = record.get("target")
+    if tgt and tgt in df.columns:
+        total_from_y = float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum())
 
-# ===== Residual (on Base) =====
-with tab2:
-    st.subheader("Residual re-attribution (regress Base on new channels)")
-    st.caption("Fit the **Base (intercept)** series on selected channels. The **fitted share of Base** is moved from Base% to those channels (split by fitted contributions).")
+    yhat = np.asarray(record.get("yhat", []), float)
+    total_from_yhat = float(np.nansum(yhat)) if yhat.size > 0 else 0.0
 
-    extra = st.multiselect("Channels to explain Base (not in base model)", options=[c for c in num_cols if (c not in base_set_disp and not c.startswith("_tfm_"))])
-    frac = st.slider("Apply what fraction of the *fitted* Base to reattribute?", min_value=0.1, max_value=1.0, value=1.0, step=0.1)
+    total_from_contrib = float(sum(float(s.sum()) for s in contrib.values())) if contrib else 0.0
+    candidates = [t for t in (total_from_y, total_from_yhat, total_from_contrib) if t and t > 0]
+    total_pred = candidates[0] if candidates else 1.0
 
-    if st.button("Run residual re-attribution", type="primary"):
-        try:
-            out = am.residual_reattribute(df=df, base_record=base, extra_channels=extra, fraction=frac)
-            new_decomp = am.apply_decomp_update(base, df, out)
-            st.success(f"Residual computed. Fitted share of Base = {out['fitted_share_of_base']*100:.1f}%. Applied fraction = {out['fraction']*100:.0f}%.")
-            st.write(pd.DataFrame([{
-                "Base % before": out["base_pct_before"],
-                "Base % after": out["base_pct_after"],
-                "Fitted Base share (%)": out["fitted_share_of_base"] * 100.0
-            }]))
-            st.dataframe(pd.DataFrame({"Channel": list(out["allocated"].keys()),
-                                       "Allocated (pp)": list(out["allocated"].values())}),
-                         use_container_width=True)
-            _render_decomp(new_decomp)
+    base_sum = float(contrib.get("const", pd.Series(0.0, index=df.index)).sum())
+    base_pct = 100.0 * base_sum / total_pred
 
-            c1, c2 = st.columns(2)
-            with c1:
-                name_new = st.text_input("Save as name", value=f"{base['name']}__residual_on_base")
-                if st.button("Save as new result", key="save_resid"):
-                    where = _persist_record(name_new, base.get("target","?"), base["dataset"], {**base, "type": "residual_reattribute", "decomp": new_decomp})
-                    st.success(f"Saved to `{where}`.")
-            with c2:
-                if st.button("Update base result", key="upd_resid"):
-                    _overwrite_base(base["name"], new_decomp)
-                    st.success("Base model updated.")
-        except Exception as e:
-            st.error("Residual re-attribution failed.")
-            st.exception(e)
+    impact_map: Dict[str, float] = {}
+    for f, s in contrib.items():
+        if f == "const":
+            continue
+        val = float((s.clip(lower=0.0)).sum())
+        if val <= 0:
+            continue
+        disp = f[:-5] if f.endswith("__tfm") else f
+        impact_map[disp] = impact_map.get(disp, 0.0) + 100.0 * val / total_pred
 
-# ===== Pathway redistribution =====
-with tab3:
-    st.subheader("Pathway redistribution")
-    if not features_disp:
-        st.warning("No channels found in base features.")
+    new_decomp = {
+        "base_pct": base_pct,
+        "carryover_pct": 0.0,
+        "incremental_pct": float(sum(impact_map.values())),
+        "impactable_pct": impact_map
+    }
+    return _normalize_and_round_decomp(new_decomp)
+
+def _normalize_and_round_decomp(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure Base% + Carryover% + Incremental% = 100 (± rounding), and round nicely."""
+    base_pct = float(d.get("base_pct", 0.0))
+    carry_pct = float(d.get("carryover_pct", 0.0))
+    impact_map: Dict[str, float] = dict(d.get("impactable_pct", {}))
+    incr_pct = float(sum(impact_map.values()))
+
+    total = base_pct + carry_pct + incr_pct
+    if incr_pct > 0 and abs(total - 100.0) > 0.05:
+        target_incr = max(0.0, 100.0 - base_pct - carry_pct)
+        scale = target_incr / incr_pct if incr_pct > 0 else 1.0
+        for k in list(impact_map.keys()):
+            impact_map[k] *= scale
+        incr_pct = float(sum(impact_map.values()))
+
+    base_pct = float(round(base_pct, 6))
+    carry_pct = float(round(carry_pct, 6))
+    impact_map = {k: float(round(v, 6)) for k, v in impact_map.items()}
+    incr_pct = float(round(sum(impact_map.values()), 6))
+    return {
+        "base_pct": base_pct,
+        "carryover_pct": carry_pct,
+        "incremental_pct": incr_pct,
+        "impactable_pct": impact_map
+    }
+
+# ---------------------------
+# Breakout split
+# ---------------------------
+def breakout_split(
+    df: pd.DataFrame,
+    base_record: Dict[str, Any],
+    channel_to_split: str,
+    sub_metrics: List[str],
+) -> Dict[str, Any]:
+    """
+    Redistribute one channel’s impact across chosen sub-metrics. Totals preserved.
+    Fit: y_parent_contrib ≈ X_sub w   (no intercept), w>=0 (via clipping).
+    """
+    coef = base_record.get("coef", {}) or {}
+    features = [f for f in base_record.get("features", []) or [] if f != "const"]
+    # find actual feature name
+    parent_feat: Optional[str] = None
+    for f in features:
+        disp = f[:-5] if f.endswith("__tfm") else f
+        if disp == channel_to_split:
+            parent_feat = f; break
+    if parent_feat is None:
+        raise ValueError(f"Channel '{channel_to_split}' not found in base features.")
+
+    decomp = _ensure_decomp_from_record_or_recompute(base_record, df)
+    parent_pct = float(decomp.get("impactable_pct", {}).get(channel_to_split, 0.0))
+    if parent_pct <= 0:
+        return {
+            "type": "breakout_split",
+            "split_channel": channel_to_split,
+            "original_channel_pct": 0.0,
+            "allocated": {},
+            "note": "Parent impact is 0; nothing to split."
+        }
+
+    # y = parent contribution
+    y = (float(coef.get(parent_feat, 0.0)) * _feature_series(df, parent_feat)).values.astype(float)
+    y = np.maximum(y, 0.0)
+
+    # X = sub metrics
+    X_cols: List[np.ndarray] = []
+    names: List[str] = []
+    for m in sub_metrics:
+        col = f"{m}__tfm" if f"{m}__tfm" in df.columns else m
+        s = _feature_series(df, col).values.astype(float)
+        s = np.maximum(s, 0.0)
+        if s.sum() <= 0:
+            continue
+        X_cols.append(s); names.append(m)
+    if not X_cols:
+        raise ValueError("No valid sub-metric series found (zero or missing).")
+
+    X = np.column_stack(X_cols)
+    try:
+        w, *_ = np.linalg.lstsq(X, y, rcond=None)
+        w = np.maximum(w, 0.0)
+    except Exception:
+        w = np.maximum(np.array([c.mean() for c in X_cols], dtype=float), 0.0)
+
+    comp = np.array([w[j] * X_cols[j].mean() for j in range(len(X_cols))], dtype=float)
+    denom = float(np.sum(comp))
+    shares = (comp / denom) if denom > 1e-12 else np.ones_like(comp) / len(comp)
+
+    allocated = {names[j]: float(parent_pct * shares[j]) for j in range(len(names))}
+    return {
+        "type": "breakout_split",
+        "split_channel": channel_to_split,
+        "original_channel_pct": parent_pct,
+        "allocated": allocated,
+        "note": "Sub-metric % add up to the original channel impact."
+    }
+
+# ---------------------------
+# Residual re-attribution
+# ---------------------------
+def residual_reattribute(
+    df: pd.DataFrame,
+    base_record: Dict[str, Any],
+    extra_channels: List[str],
+    fraction: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Fit the Base (intercept) series on selected channels:
+        base(t) ≈ Σ_j w_j * X_j(t)   (no intercept, w>=0 via clipping)
+    Allocate (fraction * fitted_share_of_base) of Base% to the channels by fitted shares.
+    """
+    fraction = max(0.0, min(1.0, float(fraction)))
+    d0 = _ensure_decomp_from_record_or_recompute(base_record, df)
+    base_pct_before = float(d0.get("base_pct", 0.0))
+
+    coef = base_record.get("coef", {}) or {}
+    features = base_record.get("features", []) or []
+    ik = _intercept_key(coef)
+    n = len(df)
+
+    # Build base series
+    if ik is not None:
+        intercept_val = float(coef.get(ik, 0.0))
+        base_series = pd.Series(np.full(n, intercept_val), index=df.index, name="base_intercept")
     else:
-        A = st.selectbox("Channel A (loses some share)", options=features_disp, index=0, key="path_A")
-        B = st.selectbox("Channel B (gains that share)", options=[c for c in features_disp if c != A], index=0, key="path_B")
+        # Reconstruct flat base to match Base%
+        tgt = base_record.get("target")
+        candidates = []
+        if tgt and tgt in df.columns:
+            candidates.append(float(pd.to_numeric(df[tgt], errors="coerce").fillna(0.0).sum()))
+        yhat = np.asarray(base_record.get("yhat", []), float)
+        if yhat.size > 0:
+            candidates.append(float(np.nansum(yhat)))
+        contrib_total = 0.0
+        for f in features:
+            if f == "const": continue
+            c = float(coef.get(f, 0.0))
+            contrib_total += float((c * _feature_series(df, f)).clip(lower=0.0).sum())
+        candidates.append(contrib_total if contrib_total > 0 else 0.0)
+        denom = next((t for t in candidates if t and t > 0), 1.0)
+        base_total_level = denom * (base_pct_before / 100.0)
+        base_series = pd.Series(np.full(n, base_total_level / max(n, 1)), index=df.index, name="base_flat")
 
-        if st.button("Run pathway redistribution", type="primary"):
-            try:
-                out = am.pathway_redistribute(df=df, base_record=base, channel_A=A, channel_B=B)
-                new_decomp = am.apply_decomp_update(base, df, out)
-                st.success("Pathway redistribution computed. Preview below:")
-                st.write(pd.DataFrame([{
-                    "Share from A→B": out["share_from_A_to_B"],
-                    "Moved (pp)": out["moved_pct_points"],
-                    "A old": out["A_old"], "A new": out["A_new"],
-                    "B old": out["B_old"], "B new": out["B_new"],
-                }]))
-                _render_decomp(new_decomp)
+    base_sum = float(base_series.sum())
+    if base_sum <= 0 or base_pct_before <= 0:
+        return {"type": "residual_reattribute", "base_pct_before": base_pct_before,
+                "fraction": 0.0, "fitted_share_of_base": 0.0, "allocated": {},
+                "base_pct_after": base_pct_before, "note": "No base available to reattribute."}
 
-                c1, c2 = st.columns(2)
-                with c1:
-                    name_new = st.text_input("Save as name", value=f"{base['name']}__pathway_{A}_to_{B}")
-                    if st.button("Save as new result", key="save_path"):
-                        where = _persist_record(name_new, base.get("target","?"), base["dataset"], {**base, "type": "pathway_redistribute", "decomp": new_decomp})
-                        st.success(f"Saved to `{where}`.")
-                with c2:
-                    if st.button("Update base result", key="upd_path"):
-                        _overwrite_base(base["name"], new_decomp)
-                        st.success("Base model updated.")
-            except Exception as e:
-                st.error("Pathway redistribution failed.")
-                st.exception(e)
+    # X matrix from extra channels
+    X_cols: List[np.ndarray] = []
+    names: List[str] = []
+    for c in extra_channels:
+        col = f"{c}__tfm" if f"{c}__tfm" in df.columns else c
+        s = _feature_series(df, col).values.astype(float)
+        s = np.maximum(s, 0.0)
+        mx = float(s.max()) if s.size else 0.0
+        if mx <= 0: continue
+        X_cols.append(s / mx); names.append(c)
+    if not X_cols:
+        raise ValueError("No valid extra channel series found to reattribute base.")
+
+    X = np.column_stack(X_cols)
+    y = base_series.values.astype(float)
+
+    try:
+        w, *_ = np.linalg.lstsq(X, y, rcond=None)
+        w = np.maximum(w, 0.0)
+    except Exception:
+        w = np.maximum(np.ones((X.shape[1],), dtype=float), 0.0)
+
+    yhat = X @ w
+    yhat_sum = float(np.sum(np.maximum(yhat, 0.0)))
+    fitted_share = float(max(0.0, min(1.0, yhat_sum / base_sum)))
+
+    per_ch_sum = []
+    for j in range(X.shape[1]):
+        yj = np.maximum(w[j] * X[:, j], 0.0)
+        per_ch_sum.append(float(np.sum(yj)))
+    per_ch_sum = np.array(per_ch_sum, dtype=float)
+    denom = float(per_ch_sum.sum())
+    shares = per_ch_sum / denom if denom > 1e-12 else np.ones_like(per_ch_sum) / len(per_ch_sum)
+
+    total_alloc_pct = base_pct_before * fitted_share * fraction
+    allocated = {names[j]: float(total_alloc_pct * shares[j]) for j in range(len(names))}
+    base_pct_after = max(0.0, base_pct_before - total_alloc_pct)
+
+    return {
+        "type": "residual_reattribute",
+        "base_pct_before": float(round(base_pct_before, 6)),
+        "fraction": float(round(fraction, 6)),
+        "fitted_share_of_base": float(round(fitted_share, 6)),
+        "allocated": {k: float(round(v, 6)) for k, v in allocated.items()},
+        "base_pct_after": float(round(base_pct_after, 6)),
+        "note": "Allocated pp come out of Base %; Incremental % increases by the same total."
+    }
+
+# ---------------------------
+# Pathway redistribution
+# ---------------------------
+def pathway_redistribute(
+    df: pd.DataFrame,
+    base_record: Dict[str, Any],
+    channel_A: str,
+    channel_B: str,
+) -> Dict[str, Any]:
+    """
+    Share s inferred from nonnegative single-factor fit:
+      contrib_A ≈ w * X_B (no intercept), s = min(1, sum(yhat)/sum(contrib_A))
+    A_new = (1 - s)*A_old;  B_new = B_old + s*A_old
+    """
+    coef = base_record.get("coef", {}) or {}
+    features = [f for f in base_record.get("features", []) or [] if f != "const"]
+    d0 = _ensure_decomp_from_record_or_recompute(base_record, df)
+    impact_map = dict(d0.get("impactable_pct", {}))
+
+    def _find_feat(disp: str) -> Optional[str]:
+        for f in features:
+            nm = f[:-5] if f.endswith("__tfm") else f
+            if nm == disp:
+                return f
+        return None
+
+    fA = _find_feat(channel_A)
+    fB = _find_feat(channel_B)
+    if fA is None or fB is None:
+        raise ValueError("Selected channels not found in base features.")
+
+    y = (float(coef.get(fA, 0.0)) * _feature_series(df, fA)).values.astype(float)
+    y = np.maximum(y, 0.0)
+    Xb = _feature_series(df, fB).values.astype(float)
+    Xb = np.maximum(Xb, 0.0)
+
+    num = float(np.dot(Xb, y)); den = float(np.dot(Xb, Xb))
+    w = 0.0 if den <= 1e-12 else max(0.0, num / den)
+    yhat = w * Xb
+    s_raw = 0.0 if y.sum() <= 1e-12 else float(np.sum(yhat) / np.sum(y))
+    s = float(max(0.0, min(1.0, s_raw)))
+
+    A_old = float(impact_map.get(channel_A, 0.0))
+    B_old = float(impact_map.get(channel_B, 0.0))
+    move = float(A_old * s)
+    A_new = float(A_old - move)
+    B_new = float(B_old + move)
+
+    return {
+        "type": "pathway_redistribute",
+        "channel_A": channel_A, "channel_B": channel_B,
+        "share_from_A_to_B": float(round(s, 6)),
+        "moved_pct_points": float(round(move, 6)),
+        "A_old": float(round(A_old, 6)), "A_new": float(round(A_new, 6)),
+        "B_old": float(round(B_old, 6)), "B_new": float(round(B_new, 6)),
+        "note": "Totals preserved."
+    }
+
+# ---------------------------
+# Apply update to base decomp
+# ---------------------------
+def apply_decomp_update(base_record: Dict[str, Any], df: pd.DataFrame, update: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Combine an update with the base decomp:
+      - breakout_split: replace parent channel with allocated children
+      - residual_reattribute: move fitted Base % to new channels (by shares)
+      - pathway_redistribute: move % from A to B
+    """
+    d0 = _ensure_decomp_from_record_or_recompute(base_record, df)
+    impact = dict(d0.get("impactable_pct", {}))
+    base_pct = float(d0.get("base_pct", 0.0))
+    carry_pct = float(d0.get("carryover_pct", 0.0))
+
+    t = update.get("type")
+
+    if t == "breakout_split":
+        parent = update["split_channel"]
+        alloc: Dict[str, float] = update.get("allocated", {})
+        if parent in impact:
+            del impact[parent]
+        for k, v in alloc.items():
+            impact[k] = impact.get(k, 0.0) + float(v)
+
+    elif t == "residual_reattribute":
+        alloc: Dict[str, float] = update.get("allocated", {})
+        total = float(sum(alloc.values()))
+        base_pct = max(0.0, base_pct - total)
+        for k, v in alloc.items():
+            impact[k] = impact.get(k, 0.0) + float(v)
+
+    elif t == "pathway_redistribute":
+        A = update["channel_A"]; B = update["channel_B"]
+        move = float(update.get("moved_pct_points", 0.0))
+        if A in impact:
+            impact[A] = max(0.0, float(impact[A]) - move)
+        impact[B] = impact.get(B, 0.0) + move
+
+    incr_pct = float(sum(impact.values()))
+    total_pct = base_pct + carry_pct + incr_pct
+    if incr_pct > 0 and abs(total_pct - 100.0) > 0.05:
+        scale = max(0.0, 100.0 - base_pct - carry_pct) / incr_pct
+        for k in list(impact.keys()):
+            impact[k] *= scale
+        incr_pct = float(sum(impact.values()))
+
+    # round
+    base_pct = float(round(base_pct, 6))
+    carry_pct = float(round(carry_pct, 6))
+    impact = {k: float(round(v, 6)) for k, v in impact.items()}
+    incr_pct = float(round(sum(impact.values()), 6))
+
+    return {
+        "base_pct": base_pct,
+        "carryover_pct": carry_pct,
+        "incremental_pct": incr_pct,
+        "impactable_pct": impact
+    }
