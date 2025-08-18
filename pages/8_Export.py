@@ -3,7 +3,7 @@ import pandas as pd
 import os
 from core import export
 
-st.title("⬇️ Export")
+st.title("⬇️   Export")
 
 files = [f for f in os.listdir("data") if f.endswith(".csv")] if os.path.isdir("data") else []
 file_choice = st.selectbox("Pick dataset to export", files, index=files.index("master.csv") if "master.csv" in files else 0 if files else None)
