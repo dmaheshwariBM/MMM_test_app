@@ -1,31 +1,27 @@
 # pages/7_Budget_Optimizer.py
-# Budget Optimizer — Pharma-ready scenarios and mROI-based allocation
-# v2.3.0 (standalone; no core imports)
+# Budget Optimizer — Pharma-ready scenarios & mROI allocation with fixes
+# v2.6.0
 
 from __future__ import annotations
 import os, glob, json, math
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-PAGE_ID = "BUDGET_OPTIMIZER_v2_3_0"
+PAGE_ID = "BUDGET_OPTIMIZER_v2_6_0"
 st.title("💸 Budget Optimization")
 st.caption(f"Page ID: {PAGE_ID} — Blue Sky • Historical Optimized • Target Budget")
 
-# ------------------------------------------------------------------------------
-# Cross-page banners
-# ------------------------------------------------------------------------------
+# Banners
 if st.session_state.get("last_saved_path"):
     st.success(f"Saved: {st.session_state['last_saved_path']}")
 if st.session_state.get("last_save_error"):
     st.error(st.session_state["last_save_error"])
 
-# ------------------------------------------------------------------------------
-# Results-root discovery (shared convention across your app)
-# ------------------------------------------------------------------------------
+# ---------- results root ----------
 def _abs(p: str) -> str: return os.path.abspath(p)
 def _ensure_dir(path: str) -> bool:
     try:
@@ -45,16 +41,13 @@ def pick_writable_results_root() -> str:
               _abs("/tmp/mmm_results"),
               _abs("results")]
     for root in prefs:
-        if _ensure_dir(root):
-            return root
+        if _ensure_dir(root): return root
     fb = _abs(os.path.expanduser("~/mmm_results_fallback"))
     _ensure_dir(fb); return fb
 
 RESULTS_ROOT = pick_writable_results_root()
 
-# ------------------------------------------------------------------------------
-# Catalog helpers (load saved models; tolerant schemas)
-# ------------------------------------------------------------------------------
+# ---------- catalog ----------
 def load_models_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []; seen = set()
     for root in results_roots:
@@ -66,7 +59,6 @@ def load_models_catalog(results_roots: List[str]) -> List[Dict[str, Any]]:
                     rec = json.load(f)
                 if not isinstance(rec, dict): 
                     continue
-                # "model-like" JSONs
                 if ("coefficients" in rec) or ("coef" in rec) or ("impact_shares" in rec) or (rec.get("type") in {"base","composite","advanced"}):
                     rec["_path"] = jf
                     ts = rec.get("batch_ts")
@@ -85,7 +77,6 @@ def get_channels(model: Dict[str, Any]) -> List[str]:
     return [c for c in ch if str(c).lower() not in ("intercept","_intercept","(intercept)","base")]
 
 def get_transform_map(model: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    # expected keys: {'transform': 'negexp'|'log', 'k':..., 'beta':...}
     return model.get("transform_config") or model.get("transforms") or {}
 
 def get_current_spend(model: Dict[str, Any]) -> Dict[str, float]:
@@ -96,16 +87,13 @@ def get_impact_shares(model: Dict[str, Any]) -> Dict[str, float]:
     inc = model.get("impact_shares") or model.get("decomposition") or {}
     clean = {k: float(v) for k, v in inc.items() if str(k).lower() not in ("base","intercept")}
     s = sum(abs(v) for v in clean.values()) or 1.0
-    # normalize to sum=1 (non-negative)
     return {k: max(0.0, float(v))/s for k, v in clean.items()}
 
 def get_segments(model: Dict[str, Any]) -> List[str]:
     segs = model.get("segments") or model.get("segment_values") or []
     return list(segs) if isinstance(segs, list) else []
 
-# ------------------------------------------------------------------------------
-# Response curves & analytic derivatives (standard MMM: log / negexp)
-# ------------------------------------------------------------------------------
+# ---------- response curves ----------
 def _negexp(sp, k=0.01, beta=1.0):
     sp = max(0.0, float(sp)); k = max(0.0, float(k)); beta = max(0.0, float(beta))
     return beta * (1.0 - math.exp(-k * sp))
@@ -115,74 +103,83 @@ def _negexp_deriv(sp, k=0.01, beta=1.0):
     return beta * k * math.exp(-k * sp)
 
 def _log1p(sp, k=1.0):
-    sp = max(0.0, float(sp)); k = max(1e-12, float(k))
+    sp = max(0.0, float(sp)); k = max(1e-9, float(k))
     return math.log1p(k * sp)
 
 def _log1p_deriv(sp, k=1.0):
-    sp = max(0.0, float(sp)); k = max(1e-12, float(k))
+    sp = max(0.0, float(sp)); k = max(1e-9, float(k))
     return k / (1.0 + k * sp)
 
-def build_channel_response_and_deriv(model: Dict[str, Any], channel: str):
-    """
-    Returns (f, fprime, fprime_numeric), scaled by impact share so that
-    optimization respects the modeled relative contributions.
-    """
+def _auto_k_log(s_ref: float) -> float:
+    # Ensure visible curvature over observed scale
+    s_ref = max(1.0, float(s_ref))
+    return 1.0 / s_ref
+
+def _auto_k_negexp(s50: float) -> float:
+    # 50% saturation at s50
+    s50 = max(1.0, float(s50))
+    return math.log(2.0) / s50
+
+def build_channel_response_and_deriv(model: Dict[str, Any], channel: str,
+                                     start_spend_ref: float,
+                                     max_spend_ref: float,
+                                     auto_calibrate: bool = True):
     tfm = (get_transform_map(model) or {}).get(channel, {})
     ttype = str(tfm.get("transform", "negexp")).lower()
-    k = float(tfm.get("k", 0.01 if ttype.startswith("negexp") else 1.0))
-    beta = float(tfm.get("beta", 1.0))
-    scale = float(get_impact_shares(model).get(channel, 1.0))
+    k_in = tfm.get("k", None)
+    beta_in = tfm.get("beta", None)
+
+    # Choose ref scale
+    s_ref = max(start_spend_ref, 1.0)
+    s_max = max(max_spend_ref, s_ref)
 
     if ttype == "log":
-        def f(sp):  return scale * _log1p(sp, k=k)
-        def fp(sp): return scale * _log1p_deriv(sp, k=k)
+        k = float(k_in) if k_in is not None and float(k_in) > 0 else (_auto_k_log(s_ref) if auto_calibrate else 1.0)
+        beta = 1.0  # not used for log
+        def base_f(sp):  return _log1p(sp, k=k)
+        def base_fp(sp): return _log1p_deriv(sp, k=k)
     else:
-        def f(sp):  return scale * _negexp(sp, k=k, beta=beta)
-        def fp(sp): return scale * _negexp_deriv(sp, k=k, beta=beta)
+        # negexp
+        k = float(k_in) if k_in is not None and float(k_in) > 0 else (_auto_k_negexp(s_ref) if auto_calibrate else 0.01)
+        beta = float(beta_in) if beta_in is not None and float(beta_in) > 0 else 1.0
+        def base_f(sp):  return _negexp(sp, k=k, beta=beta)
+        def base_fp(sp): return _negexp_deriv(sp, k=k, beta=beta)
 
-    def fp_numeric(sp, h=1e-3):
-        return (f(sp + h) - f(max(0.0, sp - h))) / (2*h)
+    scale = float(get_impact_shares(model).get(channel, 1.0))
+    def f(sp):  return scale * base_f(sp)
+    def fp(sp): return scale * base_fp(sp)
 
-    return f, fp, fp_numeric
+    def fp_numeric(sp, h=1e-3): return (f(sp + h) - f(max(0.0, sp - h))) / (2*h)
+    return f, fp, fp_numeric, {"k": k, "beta": beta, "scale": scale, "type": ttype}
 
-# ------------------------------------------------------------------------------
-# Load catalog & choose model
-# ------------------------------------------------------------------------------
+# ---------- load model ----------
 CANDIDATES = [RESULTS_ROOT]
 catalog = load_models_catalog(CANDIDATES)
 if not catalog:
     st.info("No saved models found. Run/save a model first in Modeling/Results."); st.stop()
 
-preselect_path = None
-if st.session_state.get("optimizer_model_path") and os.path.exists(str(st.session_state["optimizer_model_path"])):
-    preselect_path = st.session_state["optimizer_model_path"]
-elif st.session_state.get("last_saved_path") and str(st.session_state["last_saved_path"]).endswith(".json") and os.path.exists(str(st.session_state["last_saved_path"])):
-    preselect_path = st.session_state["last_saved_path"]
+preselect_path = st.session_state.get("optimizer_model_path") or st.session_state.get("last_saved_path")
+pre_idx = 0
+if preselect_path:
+    for i, m in enumerate(catalog):
+        if m.get("_path") == preselect_path: pre_idx = i; break
 
 labels = [f"{m.get('name','(unnamed)')} | {m.get('type','base')} | {m.get('target','?')} | {m.get('_ts')}" for m in catalog]
-default_idx = 0
-if preselect_path:
-    for i, r in enumerate(catalog):
-        if r.get("_path") == preselect_path:
-            default_idx = i; break
-
-model_idx = st.selectbox("Model to optimize", options=list(range(len(catalog))), format_func=lambda i: labels[i], index=default_idx)
-model = catalog[model_idx]
+mid = st.selectbox("Model to optimize", options=list(range(len(catalog))), format_func=lambda i: labels[i], index=pre_idx)
+model = catalog[mid]
 model_path = model.get("_path","")
 st.caption(f"Loaded: {model.get('name','(unnamed)')} • {model.get('type','?')} • `{model_path}`")
 
 channels = get_channels(model)
 if not channels:
-    st.error("Saved model has no channels/features. Please save a valid model."); st.stop()
+    st.error("Saved model has no channels/features."); st.stop()
 
-# Optional: segment selection (if present in model save)
+# Optional segment (if present)
 segments = get_segments(model)
-segment = st.selectbox("Segment (optional)", options=["(all)"] + segments, index=0) if segments else None
-if segment == "(all)": segment = None
+seg = st.selectbox("Segment (optional)", options=["(all)"] + segments, index=0) if segments else None
+if seg == "(all)": seg = None
 
-# ------------------------------------------------------------------------------
-# Constraints & costs (pharma-friendly)
-# ------------------------------------------------------------------------------
+# ---------- constraints table ----------
 st.subheader("Channels & constraints")
 
 baseline_spend = get_current_spend(model)
@@ -192,69 +189,69 @@ for ch in channels:
     rows.append({
         "channel": ch,
         "start_spend": base_sp,
-        "min": 0.0,                                   # you can raise min floors for compliance/continuity
+        "min": 0.0,
         "max": (base_sp * 3.0) if base_sp > 0 else 1e9,
-        "lock_hist": False,                           # keep historical spend for this channel
-        "unit_cost": 1.0,                             # per-channel unit cost (default 1)
+        "lock_hist": False,
+        "unit_cost": 1.0,
         "step": max(1.0, round(base_sp * 0.02, 2)) if base_sp > 0 else 1.0,
-        "target_spend": None,                         # optional per-channel target for scenario 3
-        "target_lock": False                          # if True in scenario 3, fix to target_spend
+        "target_spend": None,
+        "target_lock": False
     })
 df_constraints = pd.DataFrame(rows)
 
 df_constraints = st.data_editor(
     df_constraints, key="opt_constraints", use_container_width=True, num_rows="fixed",
     column_config={
-        "channel":     st.column_config.TextColumn("Channel", disabled=True, help="Feature name from the saved model"),
+        "channel":     st.column_config.TextColumn("Channel", disabled=True),
         "start_spend": st.column_config.NumberColumn("Starting spend", step=1.0, min_value=0.0),
         "min":         st.column_config.NumberColumn("Min", step=1.0, min_value=0.0),
         "max":         st.column_config.NumberColumn("Max", step=1.0, min_value=0.0),
         "lock_hist":   st.column_config.CheckboxColumn("Keep historical"),
-        "unit_cost":   st.column_config.NumberColumn("Unit cost", step=0.1, min_value=0.0, help="Currency per unit of spend for this channel"),
-        "step":        st.column_config.NumberColumn("Granularity step", step=0.1, min_value=1e-6, help="Smaller = finer allocation, slower runtime"),
+        "unit_cost":   st.column_config.NumberColumn("Unit cost", step=0.1, min_value=0.0),
+        "step":        st.column_config.NumberColumn("Granularity step", step=0.1, min_value=1e-6),
         "target_spend":st.column_config.NumberColumn("Target spend (scenario 3)", step=1.0, min_value=0.0),
         "target_lock": st.column_config.CheckboxColumn("Lock to target (scenario 3)"),
     }
 )
 
-# Build response + derivative functions for each channel
+AUTO_CAL = st.checkbox("Auto-calibrate curvature (suggested)", value=True,
+                       help="Adjust k (and beta for negexp) from historical scale so curves behave sensibly.")
+
+# Build functions per channel (after we know constraints for scaling)
 FUNCS: Dict[str, Any] = {}
 DERIVS: Dict[str, Any] = {}
 DERIVS_NUM: Dict[str, Any] = {}
-for ch in channels:
-    f, fp, fp_num = build_channel_response_and_deriv(model, ch)
-    FUNCS[ch] = f; DERIVS[ch] = fp; DERIVS_NUM[ch] = fp_num
+META: Dict[str, Dict[str, Any]] = {}
 
-# ------------------------------------------------------------------------------
-# Economic settings for mROI (Revenue vs Profit)
-# ------------------------------------------------------------------------------
+for _, r in df_constraints.iterrows():
+    ch = r["channel"]
+    start_ref = float(r["start_spend"])
+    max_ref   = float(r["max"])
+    f, fp, fp_num, meta = build_channel_response_and_deriv(
+        model, ch, start_spend_ref=start_ref, max_spend_ref=max_ref, auto_calibrate=AUTO_CAL
+    )
+    FUNCS[ch] = f; DERIVS[ch] = fp; DERIVS_NUM[ch] = fp_num; META[ch] = meta
+
+# ---------- economics ----------
 st.subheader("Economic settings (for mROI)")
-
 c1, c2, c3 = st.columns(3)
 with c1:
-    unit_value = st.number_input("Outcome value per unit", min_value=0.0, value=1.0, step=0.1,
-                                 help="Value of 1 outcome unit (e.g., revenue per Rx).")
+    unit_value = st.number_input("Outcome value per unit", min_value=0.0, value=1.0, step=0.1)
 with c2:
-    roi_mode = st.selectbox("mROI mode", options=["Revenue mROI", "Profit mROI"], index=0,
-                            help="Profit mROI multiplies by gross margin %.")
+    roi_mode = st.selectbox("mROI mode", options=["Revenue mROI", "Profit mROI"], index=0)
 with c3:
-    margin = st.slider("Gross margin %", min_value=0, max_value=100, value=50, step=1,
-                       help="Only used when Profit mROI is selected.") / 100.0
-
+    margin = st.slider("Gross margin %", min_value=0, max_value=100, value=50, step=1) / 100.0
 val_factor = unit_value * (margin if roi_mode == "Profit mROI" else 1.0)
 
-# Per-channel unit cost map
 UNIT_COST = {r["channel"]: float(r["unit_cost"]) for _, r in df_constraints.iterrows()}
 
-# ------------------------------------------------------------------------------
-# Scenarios (exactly as requested)
-# ------------------------------------------------------------------------------
+# ---------- scenarios ----------
 st.subheader("Scenario")
 scenario = st.selectbox(
     "Choose scenario",
     options=[
         "1) Blue Sky / Profit Maximization (mROI = 1 rule)",
-        "2) Historical Optimized (reallocate, same total as historical)",
+        "2) Historical Optimized (reallocate, same total)",
         "3) Target Budget Optimization (overall target; optional per-channel targets)"
     ],
     index=0
@@ -263,44 +260,38 @@ scenario = st.selectbox(
 current_total = float(df_constraints["start_spend"].sum())
 d1, d2, d3 = st.columns(3)
 with d1: st.metric("Current total (table)", f"{current_total:,.2f}")
-with d2: floor = st.number_input("mROI floor (for 1 & 3)", min_value=0.0, value=1.0, step=0.1,
-                                 help="Blue Sky will allocate until marginal ROI approaches this.")
-with d3: target_budget = st.number_input("Target total budget (scenario 3)", min_value=0.0,
+with d2: floor = st.number_input("mROI floor (1 & 3)", min_value=0.0, value=1.0, step=0.1)
+with d3: target_budget = st.number_input("Target total (3)", min_value=0.0,
                                          value=current_total if current_total > 0 else 100.0, step=1.0)
 
-# ------------------------------------------------------------------------------
-# Core helpers: marginal ROI and greedy allocators (equimarginal)
-# ------------------------------------------------------------------------------
-def mroi_at(channel: str, spend: float) -> float:
-    """Marginal ROI at spend s: mROI(s) = f'(s) * value / unit_cost_channel"""
-    try:
-        deriv = DERIVS[channel](float(spend))
-    except Exception:
-        deriv = DERIVS_NUM[channel](float(spend))
+# ---------- core helpers ----------
+def mroi_at(channel: str, s: float) -> float:
+    try: deriv = DERIVS[channel](float(s))
+    except Exception: deriv = DERIVS_NUM[channel](float(s))
     denom = UNIT_COST.get(channel, 1.0)
-    denom = denom if denom > 0 else 1e-12
+    denom = denom if denom > 0 else 1e-9
     return (deriv * val_factor) / denom
 
+def _mgain(func, s: float, h: float) -> float:
+    # marginal gain for a +h increment (finite difference)
+    if h <= 0: return -1e18
+    try:
+        return func(s + h) - func(s)
+    except Exception:
+        return (func(s + h) - func(max(0.0, s - h))) / (2*h)
+
 def greedy_equalize_mroi(start: Dict[str, float], min_b: Dict[str, float], max_b: Dict[str, float],
-                         locks: Dict[str, bool], steps: Dict[str, float],
-                         mroi_floor: float = 1.0) -> Dict[str, float]:
-    """
-    Blue Sky / Profit: allocate increments to channel with highest positive
-    marginal PROFIT until no channel has mROI >= floor (≈1).
-    """
+                         locks: Dict[str, bool], steps: Dict[str, float], mroi_floor: float = 1.0) -> Dict[str, float]:
     ch = list(FUNCS.keys())
     spend = {c: float(max(min_b.get(c, 0.0), start.get(c, 0.0))) for c in ch}
-
-    # apply locks to freeze at historical
     for c, is_locked in locks.items():
         if is_locked:
             v = float(start.get(c, 0.0))
             spend[c] = v; min_b[c] = v; max_b[c] = v
 
-    improved = True
     guard = 0
-    while improved and guard < 2_000_000:
-        improved = False; guard += 1
+    while guard < 2_000_000:
+        guard += 1
         best_c, best_mroi = None, mroi_floor
         for c in ch:
             s = spend[c]
@@ -308,21 +299,68 @@ def greedy_equalize_mroi(start: Dict[str, float], min_b: Dict[str, float], max_b
                 r = mroi_at(c, s)
                 if r >= mroi_floor and r > best_mroi + 1e-12:
                     best_mroi, best_c = r, c
-        if best_c is not None:
-            spend[best_c] += steps[best_c]
-            improved = True
+        if best_c is None: break
+        spend[best_c] += steps[best_c]
+
     for c in ch:
         spend[c] = min(max(spend[c], min_b.get(c, 0.0)), max_b.get(c, 1e18))
     return spend
 
-def greedy_max_response_equal_budget(funcs: Dict[str, Any], start: Dict[str, float], min_b: Dict[str, float],
-                                     max_b: Dict[str, float], total_budget: float, steps: Dict[str, float],
-                                     locks: Dict[str, bool]) -> Dict[str, float]:
+def reallocate_equal_total(funcs: Dict[str, Any], start: Dict[str, float],
+                           min_b: Dict[str, float], max_b: Dict[str, float],
+                           steps: Dict[str, float], locks: Dict[str, bool],
+                           max_iter: int = 500000, tol: float = 1e-12) -> Dict[str, float]:
     """
-    Historical Optimized / Target Budget: "water-filling" equal marginal gain.
-    Allocate tiny increments to the channel with highest marginal *response*
-    until budget = target, with min/max and locks.
+    NEW: Pairwise transfer to improve objective while keeping total fixed.
+    Move delta from channel with LOWEST marginal gain to HIGHEST marginal gain
+    when feasible and improving.
     """
+    ch = list(funcs.keys())
+    s = {c: float(max(min_b.get(c, 0.0), start.get(c, 0.0))) for c in ch}
+    for c, is_locked in locks.items():
+        if is_locked:
+            v = float(start.get(c, 0.0))
+            s[c] = v; min_b[c] = v; max_b[c] = v
+
+    def mg(c):  # marginal gain per channel for +step
+        h = steps[c]
+        if s[c] + h > max_b.get(c, 1e18) + 1e-12: return -1e18
+        return _mgain(funcs[c], s[c], h)
+
+    def mloss(c):  # loss if we remove step
+        h = steps[c]
+        if s[c] - h < min_b.get(c, 0.0) - 1e-12: return 1e18
+        # loss = gain we would have had by adding that step at (s-h)
+        return _mgain(funcs[c], s[c] - h, h)
+
+    it = 0
+    while it < max_iter:
+        it += 1
+        gains = {c: mg(c) for c in ch}
+        losses = {c: mloss(c) for c in ch}
+
+        c_add = max(gains, key=gains.get)
+        c_rem = min(losses, key=losses.get)
+
+        best_gain = gains[c_add]
+        worst_loss = losses[c_rem]
+
+        # Only move if net improvement > tol
+        if best_gain - worst_loss > tol:
+            delta = min(steps[c_add], steps[c_rem])
+            if s[c_rem] - delta >= min_b.get(c_rem, 0.0) - 1e-12 and s[c_add] + delta <= max_b.get(c_add, 1e18) + 1e-12:
+                s[c_rem] -= delta
+                s[c_add] += delta
+            else:
+                break
+        else:
+            break
+    return s
+
+def waterfill_to_target(funcs: Dict[str, Any], start: Dict[str, float], min_b: Dict[str, float],
+                        max_b: Dict[str, float], total_budget: float, steps: Dict[str, float],
+                        locks: Dict[str, bool], max_iter: int = 500000) -> Dict[str, float]:
+    """As before, but with only-add/remove to meet a target total."""
     ch = list(funcs.keys())
     spend = {c: float(max(min_b.get(c, 0.0), start.get(c, 0.0))) for c in ch}
     for c, is_locked in locks.items():
@@ -330,43 +368,33 @@ def greedy_max_response_equal_budget(funcs: Dict[str, Any], start: Dict[str, flo
             v = float(start.get(c, 0.0))
             spend[c] = v; min_b[c] = v; max_b[c] = v
 
-    # Make current total match target by coarse rebalancing if needed
-    cur_total = sum(spend.values())
-    tgt_total = float(total_budget)
+    cur_total = sum(spend.values()); tgt_total = float(total_budget)
 
-    def mg(c, s, h):  # marginal gain in response for step h
-        try:
-            return funcs[c](s + h) - funcs[c](s)
-        except Exception:
-            # numeric fallback if needed
-            return (funcs[c](s + h) - funcs[c](max(0.0, s - h))) / (2*h)
+    def mg(c, s, h):
+        return _mgain(funcs[c], s, h)
 
-    # Add budget if under
-    guard = 0
-    while cur_total + 1e-9 < tgt_total and guard < 2_000_000:
-        guard += 1
+    it = 0
+    while cur_total + 1e-9 < tgt_total and it < max_iter:
+        it += 1
         best_c, best_gain = None, -1e18
         for c in ch:
             h = steps[c]
             if spend[c] + h <= max_b.get(c, 1e18) + 1e-12:
                 g = mg(c, spend[c], h)
-                if g > best_gain:
-                    best_gain, best_c = g, c
+                if g > best_gain: best_gain, best_c = g, c
         if best_c is None: break
         spend[best_c] += steps[best_c]
         cur_total += steps[best_c]
 
-    # Remove budget if over
-    guard = 0
-    while cur_total - 1e-9 > tgt_total and guard < 2_000_000:
-        guard += 1
+    it = 0
+    while cur_total - 1e-9 > tgt_total and it < max_iter:
+        it += 1
         worst_c, worst_loss = None, 1e18
         for c in ch:
             h = steps[c]
             if spend[c] - h >= min_b.get(c, 0.0) - 1e-12:
-                loss = mg(c, spend[c]-h, h)  # gain you'd lose by removing h
-                if loss < worst_loss:
-                    worst_loss, worst_c = loss, c
+                loss = _mgain(funcs[c], spend[c]-h, h)
+                if loss < worst_loss: worst_loss, worst_c = loss, c
         if worst_c is None: break
         spend[worst_c] -= steps[worst_c]
         cur_total -= steps[worst_c]
@@ -375,9 +403,7 @@ def greedy_max_response_equal_budget(funcs: Dict[str, Any], start: Dict[str, flo
         spend[c] = min(max(spend[c], min_b.get(c, 0.0)), max_b.get(c, 1e18))
     return spend
 
-# ------------------------------------------------------------------------------
-# Run optimization
-# ------------------------------------------------------------------------------
+# ---------- run ----------
 if st.button("Run optimization", type="primary", use_container_width=True):
     try:
         start = {r["channel"]: float(r["start_spend"]) for _, r in df_constraints.iterrows()}
@@ -388,43 +414,49 @@ if st.button("Run optimization", type="primary", use_container_width=True):
         targets= {r["channel"]: (None if r["target_spend"] is None else float(r["target_spend"])) for _, r in df_constraints.iterrows()}
         tlocks = {r["channel"]: bool(r["target_lock"]) for _, r in df_constraints.iterrows()}
 
-        # Apply per-channel target locks (scenario 3)
+        # Scenario 3: enforce channel targets (locks)
         if scenario.startswith("3)"):
             for c in channels:
                 if tlocks[c] and targets[c] is not None:
-                    v = float(targets[c])
-                    min_b[c] = v; max_b[c] = v
+                    v = float(targets[c]); min_b[c] = v; max_b[c] = v
 
-        if scenario.startswith("1)"):  # Blue Sky / Profit (mROI = 1 rule)
+        if scenario.startswith("1)"):
+            # Blue Sky / Profit mROI rule
             result_spend = greedy_equalize_mroi(start, min_b, max_b, locks, steps, mroi_floor=float(floor))
 
-        elif scenario.startswith("2)"):  # same total as historical
-            total = sum(start.values())
-            result_spend = greedy_max_response_equal_budget(FUNCS, start, min_b, max_b, total_budget=total, steps=steps, locks=locks)
+        elif scenario.startswith("2)"):
+            # NEW: reallocation with constant total
+            result_spend = reallocate_equal_total(FUNCS, start, min_b, max_b, steps, locks)
 
-        else:  # scenario 3 Target Budget
-            result_spend = greedy_max_response_equal_budget(FUNCS, start, min_b, max_b, total_budget=float(target_budget), steps=steps, locks=locks)
+        else:
+            # Target total (water-fill)
+            result_spend = waterfill_to_target(FUNCS, start, min_b, max_b, float(target_budget), steps, locks)
 
-        # Summaries
+        # Summaries & diagnostics
         result_df = pd.DataFrame({
             "channel": list(result_spend.keys()),
             "optimized_spend": [result_spend[c] for c in result_spend],
             "start_spend": [start.get(c, 0.0) for c in result_spend],
-            "unit_cost": [UNIT_COST.get(c, 1.0) for c in result_spend]
+            "unit_cost": [UNIT_COST.get(c, 1.0) for c in result_spend],
+            "k": [META[c]["k"] for c in result_spend],
+            "beta": [META[c]["beta"] for c in result_spend],
+            "transform": [META[c]["type"] for c in result_spend],
         })
         result_df["delta"] = result_df["optimized_spend"] - result_df["start_spend"]
 
-        # Effects and marginal ROI at the optimized point
         eff_start = {c: FUNCS[c](start.get(c, 0.0)) for c in result_spend}
         eff_opt   = {c: FUNCS[c](result_spend[c]) for c in result_spend}
         result_df["effect_start"] = result_df["channel"].map(lambda c: eff_start[c])
         result_df["effect_opt"]   = result_df["channel"].map(lambda c: eff_opt[c])
         result_df["effect_delta"] = result_df["effect_opt"] - result_df["effect_start"]
-        result_df["mROI_opt"]     = result_df.apply(lambda r: mroi_at(r["channel"], r["optimized_spend"]), axis=1)
+
+        result_df["mROI_at_opt"] = result_df.apply(lambda r: mroi_at(r["channel"], r["optimized_spend"]), axis=1)
+        result_df["mROI_at_start"] = result_df.apply(lambda r: mroi_at(r["channel"], r["start_spend"]), axis=1)
 
         st.success("Optimization complete.")
         st.dataframe(result_df.sort_values("optimized_spend", ascending=False), use_container_width=True)
 
+        # Store state
         st.session_state["opt_last_result"] = {
             "model_path": model_path,
             "model_name": model.get("name", ""),
@@ -433,8 +465,8 @@ if st.button("Run optimization", type="primary", use_container_width=True):
             "roi_mode": roi_mode,
             "gross_margin": margin,
             "mroi_floor": float(floor),
-            "target_budget": float(target_budget) if scenario.startswith("3)") else (sum(start.values()) if scenario.startswith("2)") else None),
-            "allocation": result_spend,
+            "target_budget": float(target_budget) if scenario.startswith("3)") else sum(start.values()) if scenario.startswith("2)") else None,
+            "allocation": {c: float(result_spend[c]) for c in result_spend},
             "constraints_table": df_constraints.to_dict(orient="list"),
             "result_table": result_df.to_dict(orient="records"),
         }
@@ -442,9 +474,7 @@ if st.button("Run optimization", type="primary", use_container_width=True):
     except Exception as e:
         st.error(f"Optimization failed: {e}")
 
-# ------------------------------------------------------------------------------
-# Save optimization (JSON + CSV)
-# ------------------------------------------------------------------------------
+# ---------- save ----------
 st.divider()
 st.subheader("Save optimization")
 
@@ -474,9 +504,7 @@ if st.button("Save scenario"):
             st.session_state["last_save_error"] = f"Save failed: {e}"
             st.error(st.session_state["last_save_error"])
 
-# ------------------------------------------------------------------------------
-# Response curves (effect & mROI vs spend)
-# ------------------------------------------------------------------------------
+# ---------- response curves ----------
 st.divider()
 st.subheader("Response curves")
 
@@ -487,22 +515,27 @@ except Exception:
     ALT = False
 
 curve_channels = st.multiselect("Select channels", options=channels, default=channels[:min(5, len(channels))])
-max_hint = {str(r["channel"]): float(r["max"]) for _, r in df_constraints.iterrows()}
-x_points = st.number_input("Curve horizon (max spend per channel)", min_value=10.0,
-                           value=max(100.0, max(max_hint.values()) if max_hint else 100.0), step=10.0)
-n_points = st.slider("Points per curve", min_value=20, max_value=200, value=100)
+
+# Per-channel horizon based on max constraint for better visuals
+max_by_ch = {r["channel"]: float(r["max"]) for _, r in df_constraints.iterrows()}
+n_points = st.slider("Points per curve", min_value=50, max_value=400, value=150)
 
 if st.button("Generate curves"):
     try:
         rows = []
         for ch in curve_channels:
-            f, fp, _ = build_channel_response_and_deriv(model, ch)
-            xs = np.linspace(0.0, float(x_points), int(n_points))
+            f = FUNCS[ch]; fp = DERIVS[ch]
+            x_max = max(50.0, max_by_ch.get(ch, 100.0))
+            xs = np.linspace(0.0, x_max, int(n_points))
             ys = [f(x) for x in xs]
             mrois = []
+            denom = UNIT_COST.get(ch, 1.0); denom = denom if denom > 0 else 1e-9
             for x in xs:
-                denom = UNIT_COST.get(ch, 1.0); denom = denom if denom > 0 else 1e-12
-                mrois.append((fp(x) * val_factor) / denom)
+                try:
+                    der = fp(x)
+                except Exception:
+                    der = (f(x+1e-3)-f(max(0.0, x-1e-3)))/2e-3
+                mrois.append((der * val_factor) / denom)
             for x, y, r in zip(xs, ys, mrois):
                 rows.append({"channel": ch, "spend": float(x), "effect": float(y), "mROI": float(r)})
         curve_df = pd.DataFrame(rows)
