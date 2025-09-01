@@ -1,5 +1,5 @@
 # core/advanced_models.py
-# v1.4.0  ASCII-only. Deterministic, dependency-light advanced adjustments.
+# v1.4.0  ASCII-only. Deterministic, dependency-light advanced adjustments
 # Implements:
 #   - _ensure_decomp_from_record_or_recompute(record, df)
 #   - breakout_split(df, base_record, channel_to_split, sub_metrics)
