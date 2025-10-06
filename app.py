@@ -207,6 +207,28 @@ if st.session_state.get("last_saved_path"):
 if st.session_state.get("last_save_error"):
     st.error(st.session_state["last_save_error"])
 
+# --- Optional DB test button (hidden unless explicitly enabled) ---
+_show_db_test = False
+try:
+    # prefer Streamlit secrets, fall back to env var
+    _show_db_test = bool(st.secrets.get("SHOW_DB_TEST_BUTTON", False))
+except Exception:
+    import os as _os
+    _show_db_test = _os.getenv("SHOW_DB_TEST_BUTTON", "false").lower() in ("1", "true", "yes")
+
+if _show_db_test:
+    import streamlit as _st
+    from core.db import get_client, get_db, get_gridfs
+
+    if st.button("Test DB connection"):
+        try:
+            client = get_client()
+            st.success("Connected to MongoDB - server version: {}".format(client.server_info().get("version")))
+            st.write("DB name:", get_db().name)
+            st.write("GridFS collection prefix:", get_gridfs()._collection.name)
+        except Exception as e:
+            st.error("DB connection failed: {}".format(e))
+
 left, right = st.columns([2, 3], gap="large")
 
 # ---------- Left: Data inventory ----------
