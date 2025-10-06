@@ -1,0 +1,17 @@
+.env
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+venv/
+env/
+/.venv
+/.env
+/.idea
+.vscode
+dist/
+build/
+uploads/
+downloads/
+tests/tmp_*

@@ -2,11 +2,13 @@
 # v1.7.0  Upload, delete, inspect, and correlation (Altair heatmap; no matplotlib needed)
 
 import os
+import json
 from datetime import datetime
 from typing import List, Dict
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 import streamlit as st
 
 # Try Altair for heatmap (Streamlit ships with it); fall back to table-only if unavailable
@@ -71,6 +73,24 @@ if uploaded:
             st.error("Failed to save {}: {}".format(uf.name, e))
     if saved:
         st.success("Uploaded {} file(s) to data/".format(saved))
+        # After saving locally, attempt to save a small preview to remote DB (if configured)
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            import os as _os
+            if _os.getenv("MONGO_URI"):
+                from core import remote_store as rs
+                # generate preview for the last uploaded file (uf is last in loop)
+                try:
+                    preview_df = _load_df(dest)
+                    preview_json = preview_df.head(20).to_dict(orient="records")
+                    rs.save_preview(uf.name, {"rows": preview_json, "columns": list(preview_df.columns)})
+                    st.info("Saved preview of '{}' to remote DB".format(uf.name))
+                except Exception as e:
+                    st.warning("Could not save preview to remote DB: {}".format(e))
+        except Exception:
+            # dotenv or remote not configured; ignore silently
+            pass
         st.rerun()
 
 # ---------------- Inventory + Delete ----------------
@@ -243,3 +263,6 @@ else:
                 file_name="{}_correlation.csv".format(os.path.splitext(sel_file)[0]),
                 mime="text/csv",
             )
+
+
+# (Remote store UI intentionally removed; this page focuses on local upload/inspect)

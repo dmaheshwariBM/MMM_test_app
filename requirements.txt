@@ -10,3 +10,6 @@ openpyxl
 snowflake-connector-python
 pyyaml
 Pillow
+
+pymongo
+python-dotenv

@@ -244,6 +244,8 @@ with left:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+    
+
 # ---------- Right: Latest model + recent runs ----------
 with right:
     st.markdown('<div class="card">', unsafe_allow_html=True)
